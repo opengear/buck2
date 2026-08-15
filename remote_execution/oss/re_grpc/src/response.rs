@@ -295,6 +295,32 @@ pub struct ExecuteWithProgressResponse {
     pub stage: Stage,
     pub execute_response: Option<ExecuteResponse>,
     pub metadata: OperationMetadata,
+    pub reattach_stats: ExecuteReattachStats,
+}
+
+/// Cumulative counters for execute-stream reattach activity on a single `execute_with_progress`
+/// call, snapshotted onto every yielded `ExecuteWithProgressResponse`. Reattaching to a stream
+/// severed by a flapping proxy or a backend rolling upgrade is transparent to the caller, whose
+/// stream keeps yielding progress. These counters are where an operator sees that activity.
+#[derive(Clone, Copy, Debug, Default, Dupe, PartialEq, Eq)]
+pub struct ExecuteReattachStats {
+    /// Number of times the stream reattached via `WaitExecution` using a known operation name.
+    pub wait_execution_reattaches: u32,
+    /// Number of times the stream reattached by issuing a fresh `Execute` call.
+    pub re_executes: u32,
+    /// Number of reattach attempts classified as a transport-level disconnect: a TCP reset, a
+    /// TLS close, or an HTTP/2 connection torn down mid-shutdown.
+    pub severed_io: u32,
+    /// Number of reattach attempts classified as an HTTP/2 protocol-level shutdown signal: a
+    /// GOAWAY with reason `NO_ERROR`, or a refused stream on a connection being drained.
+    pub severed_goaway: u32,
+    /// Number of reattach attempts observed as a clean end of stream before a terminal message.
+    pub clean_eof: u32,
+    /// Number of `WaitExecution` calls that returned `NOT_FOUND`, requiring a re-`Execute`.
+    pub operation_not_found: u32,
+    /// Number of reattach attempts that failed to establish a new stream because the RE
+    /// endpoint refused the connection outright.
+    pub dial_failures: u32,
 }
 
 #[derive(Clone, Debug, Dupe, Default)]

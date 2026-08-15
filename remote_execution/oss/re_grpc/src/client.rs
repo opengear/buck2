@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -61,6 +62,7 @@ use re_grpc_proto::build::bazel::remote::execution::v2::RequestMetadata;
 use re_grpc_proto::build::bazel::remote::execution::v2::ResultsCachePolicy;
 use re_grpc_proto::build::bazel::remote::execution::v2::ToolDetails;
 use re_grpc_proto::build::bazel::remote::execution::v2::UpdateActionResultRequest;
+use re_grpc_proto::build::bazel::remote::execution::v2::WaitExecutionRequest as GWaitExecutionRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_request::Request;
 use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
@@ -73,6 +75,7 @@ use re_grpc_proto::google::bytestream::ReadResponse;
 use re_grpc_proto::google::bytestream::WriteRequest;
 use re_grpc_proto::google::bytestream::WriteResponse;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use re_grpc_proto::google::longrunning::Operation;
 use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
@@ -83,6 +86,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
 use tonic::codegen::InterceptedService;
 use tonic::metadata;
@@ -98,10 +102,50 @@ use crate::pool::ChannelPool;
 use crate::pool::PoolConfig;
 use crate::pool::PooledChannel;
 use crate::pool::create_channel;
+use crate::pool::resolve_optional_secs;
+use crate::reattach::ReattachState;
+use crate::reattach::RetryCause;
+use crate::reattach::classify;
 use crate::request::*;
 use crate::response::*;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
+
+// Defaults for the execute-stream reattach settings of `Buck2OssReConfiguration`, whose field
+// docs describe the behavior each one gates. Connection keepalive defaults live in `crate::pool`,
+// next to the endpoint construction they configure.
+const EXECUTE_REATTACH_BUDGET_SECS_DEFAULT: u64 = 60;
+const EXECUTE_REATTACH_CONCURRENCY_DEFAULT: usize = 8;
+const EXECUTE_REATTACH_CONCURRENCY_MIN: usize = 1;
+
+/// Resolves the wall-clock budget for reattaching a severed execute stream. Reattach is off
+/// unless `execute_reattach_enabled` is `Some(true)`; once enabled, the budget follows
+/// `resolve_optional_secs`'s convention, where `None` means disabled.
+fn execute_reattach_budget(opts: &Buck2OssReConfiguration) -> Option<Duration> {
+    if !opts.execute_reattach_enabled.unwrap_or(false) {
+        return None;
+    }
+    resolve_optional_secs(
+        opts.execute_reattach_budget_secs,
+        EXECUTE_REATTACH_BUDGET_SECS_DEFAULT,
+    )
+}
+
+/// Resolves the upper bound on concurrent execute-stream reattach dials. A configured `0` would
+/// build a limiter that blocks every reattach forever, so it is clamped to the minimum instead.
+fn execute_reattach_concurrency(opts: &Buck2OssReConfiguration) -> usize {
+    match opts.execute_reattach_concurrency {
+        Some(0) => {
+            tracing::warn!(
+                "RE execute reattach concurrency of 0 would block every reattach forever; \
+                 clamping to {EXECUTE_REATTACH_CONCURRENCY_MIN}",
+            );
+            EXECUTE_REATTACH_CONCURRENCY_MIN
+        }
+        Some(n) => n,
+        None => EXECUTE_REATTACH_CONCURRENCY_DEFAULT,
+    }
+}
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -175,6 +219,10 @@ pub struct RERuntimeOpts {
     cas_ttl_secs: i64,
     /// Maximum number of digests per `FindMissingBlobs` RPC.
     find_missing_blobs_batch_size: usize,
+    /// Wall-clock budget for recovering a severed execute stream, measured from when recovery
+    /// for that severance begins. `None` disables reattach: every severance propagates
+    /// unmodified.
+    execute_reattach_budget: Option<Duration>,
 }
 
 struct InstanceName(Option<String>);
@@ -311,7 +359,9 @@ impl REClientBuilder {
             max_connections,
             max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
         };
-        let pool = ChannelPool::new(pool_config, channel_config);
+        let pool = Arc::new(ChannelPool::new(pool_config, channel_config));
+
+        let execute_reattach_limiter = Arc::new(Semaphore::new(execute_reattach_concurrency(opts)));
 
         Ok(REClient::new(
             RERuntimeOpts {
@@ -321,6 +371,7 @@ impl REClientBuilder {
                 // on the TTL of the remote blob.
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
+                execute_reattach_budget: execute_reattach_budget(opts),
             },
             capabilities,
             instance_name,
@@ -331,6 +382,7 @@ impl REClientBuilder {
             cas_address,
             engine_address.clone(),
             action_cache_address,
+            execute_reattach_limiter,
         ))
     }
 
@@ -466,7 +518,9 @@ impl FindMissingCache {
 
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
-    pool: ChannelPool,
+    // `Arc` so `execute_with_progress` can hand a pool handle to its 'static reattach closures
+    // without borrowing `self` for the lifetime of the returned stream.
+    pool: Arc<ChannelPool>,
     capabilities: RECapabilities,
     instance_name: InstanceName,
     // buck2 calls find_missing for same blobs
@@ -477,6 +531,13 @@ pub struct REClient {
     cas_address: String,
     engine_address: String,
     action_cache_address: String,
+    // Bounds concurrent execute-stream reattach dials across every action sharing this client,
+    // keeping a frontend that is still restarting from taking the whole in-flight fleet's
+    // reattaches at once.
+    execute_reattach_limiter: Arc<Semaphore>,
+    // Set the first time a `WaitExecution` call on this client returns `UNIMPLEMENTED`, so every
+    // action sharing the client pays the discovery cost once.
+    execute_reattach_wait_execution_unimplemented: Arc<AtomicBool>,
 }
 
 impl Drop for REClient {
@@ -622,12 +683,13 @@ impl REClient {
         capabilities: RECapabilities,
         instance_name: InstanceName,
         bystream_compressor: Option<Compressor>,
-        pool: ChannelPool,
+        pool: Arc<ChannelPool>,
         max_decoding_msg_size: usize,
         interceptor: InjectHeadersInterceptor,
         cas_address: String,
         engine_address: String,
         action_cache_address: String,
+        execute_reattach_limiter: Arc<Semaphore>,
     ) -> Self {
         REClient {
             runtime_opts,
@@ -645,6 +707,8 @@ impl REClient {
             cas_address,
             engine_address,
             action_cache_address,
+            execute_reattach_limiter,
+            execute_reattach_wait_execution_unimplemented: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -711,131 +775,70 @@ impl REClient {
     pub async fn execute_with_progress(
         &self,
         metadata: &RemoteExecutionMetadata,
-        mut execute_request: ExecuteRequest,
+        execute_request: ExecuteRequest,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>> {
-        // TODO(aloiscochard): Map those properly in the request
-        // use crate::proto::build::bazel::remote::execution::v2::ExecutionPolicy;
+        let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
 
-        let action_digest = tdigest_to(execute_request.action_digest.clone());
-        let priority = execute_request
-            .execution_policy
-            .map(|ep| ep.priority)
-            .unwrap_or_default();
+        // Each closure pulls a fresh channel from the pool per call — for the initial `Execute`
+        // dial, every `retry()` attempt in `execute_with_progress_impl`, and every reattach
+        // `ReattachState::recover` drives — rather than holding one connection for the stream's
+        // whole lifetime.
+        let execute_pool = self.pool.dupe();
+        let execute_interceptor = self.interceptor.dupe();
+        let execute_address = self.engine_address.clone();
+        let execute_metadata = metadata.clone();
+        let execute_f = move |request: GExecuteRequest| {
+            let pool = execute_pool.dupe();
+            let interceptor = execute_interceptor.dupe();
+            let address = execute_address.clone();
+            let metadata = execute_metadata.clone();
+            async move {
+                let channel = pool.get(&address).await?;
+                let mut client =
+                    ExecutionClient::new(InterceptedService::new(channel, interceptor));
+                let stream = client
+                    .execute(with_re_metadata(request, &metadata, use_fbcode_metadata))
+                    .await?
+                    .into_inner();
+                Ok(stream.boxed())
+            }
+        };
 
-        let stream = retry(|| async {
-            let stream = self
-                .execution_client()
-                .await?
-                .execute(with_re_metadata(
-                    GExecuteRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        skip_cache_lookup: execute_request.skip_cache_lookup,
-                        execution_policy: Some(ExecutionPolicy { priority }),
-                        results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
-                        action_digest: Some(action_digest.clone()),
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?
-                .into_inner();
-            anyhow::Ok(stream)
-        })
-        .await?;
+        let wait_execution_pool = self.pool.dupe();
+        let wait_execution_interceptor = self.interceptor.dupe();
+        let wait_execution_address = self.engine_address.clone();
+        let wait_execution_metadata = metadata.clone();
+        let wait_execution_f = move |name: String| {
+            let pool = wait_execution_pool.dupe();
+            let interceptor = wait_execution_interceptor.dupe();
+            let address = wait_execution_address.clone();
+            let metadata = wait_execution_metadata.clone();
+            async move {
+                let channel = pool.get(&address).await?;
+                let mut client =
+                    ExecutionClient::new(InterceptedService::new(channel, interceptor));
+                let stream = client
+                    .wait_execution(with_re_metadata(
+                        GWaitExecutionRequest { name },
+                        &metadata,
+                        use_fbcode_metadata,
+                    ))
+                    .await?
+                    .into_inner();
+                Ok(stream.boxed())
+            }
+        };
 
-        let stream = futures::stream::try_unfold(stream, move |mut stream| async {
-            let msg = match stream.try_next().await.context("RE channel error")? {
-                Some(msg) => msg,
-                None => return Ok(None),
-            };
-
-            let status = if msg.done {
-                match msg
-                    .result
-                    .context("Missing `result` when message was `done`")?
-                {
-                    OpResult::Error(rpc_status) => {
-                        return Err(REClientError {
-                            code: TCode(rpc_status.code),
-                            message: rpc_status.message,
-                            group: TCodeReasonGroup::UNKNOWN,
-                        }
-                        .into());
-                    }
-                    OpResult::Response(any) => {
-                        let execute_response_grpc: GExecuteResponse =
-                            GExecuteResponse::decode(&any.value[..])?;
-
-                        check_status(execute_response_grpc.status.unwrap_or_default())?;
-
-                        let action_result = execute_response_grpc
-                            .result
-                            .with_context(|| "The action result is not defined.")?;
-
-                        let action_result = convert_action_result(action_result)?;
-
-                        let execute_response = ExecuteResponse {
-                            action_result,
-                            action_result_digest: TDigest::default(),
-                            action_result_ttl: 0,
-                            status: TStatus {
-                                code: TCode::OK,
-                                message: execute_response_grpc.message,
-                                ..Default::default()
-                            },
-                            cached_result: execute_response_grpc.cached_result,
-                            action_digest: Default::default(), // Filled in below.
-                        };
-
-                        ExecuteWithProgressResponse {
-                            stage: Stage::COMPLETED,
-                            execute_response: Some(execute_response),
-                            ..Default::default()
-                        }
-                    }
-                }
-            } else {
-                let meta =
-                    ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
-
-                let stage = match execution_stage::Value::try_from(meta.stage) {
-                    Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
-                    Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
-                    Ok(execution_stage::Value::Queued) => Stage::QUEUED,
-                    Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
-                    Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
-                    _ => Stage::UNKNOWN,
-                };
-
-                ExecuteWithProgressResponse {
-                    stage,
-                    execute_response: None,
-                    ..Default::default()
-                }
-            };
-
-            anyhow::Ok(Some((status, stream)))
-        });
-
-        // We fill in the action digest a little later here. We do it this way so we don't have to
-        // clone the execute_request into every future we create above.
-
-        let stream = stream.map(move |mut r| {
-            match &mut r {
-                Ok(ExecuteWithProgressResponse {
-                    execute_response: Some(response),
-                    ..
-                }) => {
-                    response.action_digest = std::mem::take(&mut execute_request.action_digest);
-                }
-                _ => {}
-            };
-
-            r
-        });
-
-        Ok(stream.boxed())
+        execute_with_progress_impl(
+            &self.instance_name,
+            execute_request,
+            execute_f,
+            wait_execution_f,
+            self.runtime_opts.execute_reattach_budget,
+            self.execute_reattach_limiter.dupe(),
+            self.execute_reattach_wait_execution_unimplemented.dupe(),
+        )
+        .await
     }
 
     pub async fn upload(
@@ -1066,14 +1069,6 @@ impl REClient {
         )
     }
 
-    async fn execution_client(&self) -> anyhow::Result<ExecutionClient<GrpcService>> {
-        let channel = self.pool.get(&self.engine_address).await?;
-        Ok(ExecutionClient::new(InterceptedService::new(
-            channel,
-            self.interceptor.dupe(),
-        )))
-    }
-
     async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
         let channel = self.pool.get(&self.action_cache_address).await?;
         Ok(ActionCacheClient::new(InterceptedService::new(
@@ -1273,6 +1268,194 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
     };
 
     Ok(action_result)
+}
+
+/// Decodes one `Operation` message from the RE execution stream into the stage or terminal
+/// response it represents. Returns an error for a malformed message or a `done` operation that
+/// carries an application-level failure. Neither is recoverable by reattaching.
+fn decode_operation(msg: Operation) -> anyhow::Result<ExecuteWithProgressResponse> {
+    if msg.done {
+        match msg
+            .result
+            .context("Missing `result` when message was `done`")?
+        {
+            OpResult::Error(rpc_status) => Err(REClientError {
+                code: TCode(rpc_status.code),
+                message: rpc_status.message,
+                group: TCodeReasonGroup::UNKNOWN,
+            }
+            .into()),
+            OpResult::Response(any) => {
+                let execute_response_grpc: GExecuteResponse =
+                    GExecuteResponse::decode(&any.value[..])?;
+
+                check_status(execute_response_grpc.status.unwrap_or_default())?;
+
+                let action_result = execute_response_grpc
+                    .result
+                    .with_context(|| "The action result is not defined.")?;
+
+                let action_result = convert_action_result(action_result)?;
+
+                let execute_response = ExecuteResponse {
+                    action_result,
+                    action_result_digest: TDigest::default(),
+                    action_result_ttl: 0,
+                    status: TStatus {
+                        code: TCode::OK,
+                        message: execute_response_grpc.message,
+                        ..Default::default()
+                    },
+                    cached_result: execute_response_grpc.cached_result,
+                    action_digest: Default::default(), // Filled in by execute_with_progress_impl.
+                };
+
+                Ok(ExecuteWithProgressResponse {
+                    stage: Stage::COMPLETED,
+                    execute_response: Some(execute_response),
+                    ..Default::default()
+                })
+            }
+        }
+    } else {
+        let meta = ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
+
+        let stage = match execution_stage::Value::try_from(meta.stage) {
+            Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
+            Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
+            Ok(execution_stage::Value::Queued) => Stage::QUEUED,
+            Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
+            Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
+            _ => Stage::UNKNOWN,
+        };
+
+        Ok(ExecuteWithProgressResponse {
+            stage,
+            execute_response: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// Drives an `Execute` call to completion, decoding each streamed `Operation` into a
+/// progress or terminal response and recovering transparently from a severed stream.
+///
+/// `execute_f` and `wait_execution_f` carry the RPC calls, so one recovery path serves the
+/// initial `Execute` call, every `Execute` reattach, and every `WaitExecution` reattach, and so
+/// tests can drive the path with scripted streams. `execute_f` issues `Execute` with the
+/// request built here; `wait_execution_f` reattaches to the operation name last seen.
+/// `execute_reattach_budget`, `execute_reattach_limiter`, and
+/// `execute_reattach_wait_execution_unimplemented` are threaded through to the `ReattachState`
+/// that owns recovery for the lifetime of the returned stream; see
+/// [`ReattachState::recover`].
+async fn execute_with_progress_impl<F, Fut, WF, WFut>(
+    instance_name: &InstanceName,
+    mut execute_request: ExecuteRequest,
+    execute_f: F,
+    wait_execution_f: WF,
+    execute_reattach_budget: Option<Duration>,
+    execute_reattach_limiter: Arc<Semaphore>,
+    execute_reattach_wait_execution_unimplemented: Arc<AtomicBool>,
+) -> anyhow::Result<BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>>
+where
+    F: Fn(GExecuteRequest) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<BoxStream<'static, Result<Operation, tonic::Status>>>>
+        + Send
+        + 'static,
+    WF: Fn(String) -> WFut + Send + 'static,
+    WFut: Future<Output = anyhow::Result<BoxStream<'static, Result<Operation, tonic::Status>>>>
+        + Send
+        + 'static,
+{
+    let action_digest = tdigest_to(execute_request.action_digest.clone());
+    let priority = execute_request
+        .execution_policy
+        .as_ref()
+        .map(|ep| ep.priority)
+        .unwrap_or_default();
+
+    let request = GExecuteRequest {
+        instance_name: instance_name.as_str().to_owned(),
+        skip_cache_lookup: execute_request.skip_cache_lookup,
+        execution_policy: Some(ExecutionPolicy { priority }),
+        results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
+        action_digest: Some(action_digest.clone()),
+        ..Default::default()
+    };
+
+    let stream = retry(|| execute_f(request.clone())).await?;
+
+    let state = ReattachState::new(
+        execute_f,
+        wait_execution_f,
+        request,
+        stream,
+        execute_reattach_budget,
+        execute_reattach_limiter,
+        execute_reattach_wait_execution_unimplemented,
+    );
+
+    let stream = futures::stream::try_unfold(state, move |mut state| async move {
+        loop {
+            if state.seen_done {
+                return Ok(None);
+            }
+
+            match state.stream.try_next().await {
+                Ok(Some(msg)) => {
+                    state.observe_message(&msg);
+                    let mut response = decode_operation(msg)?;
+                    response.reattach_stats = state.stats();
+                    return Ok(Some((response, state)));
+                }
+                Ok(None) => {
+                    // With reattach disabled, a stream ending before a terminal response ends
+                    // here as `stream.try_next()` reports it, and the consumer's own
+                    // end-of-stream handling applies.
+                    if state.is_disabled() {
+                        return Ok(None);
+                    }
+                    state
+                        .recover(
+                            RetryCause::CleanEof,
+                            anyhow::anyhow!(
+                                "the RE execute stream ended before a terminal response"
+                            ),
+                        )
+                        .await?;
+                }
+                Err(status) => match classify(&status, state.origin) {
+                    Some(cause) => {
+                        let trigger = anyhow::Error::new(status).context("RE channel error");
+                        state.recover(cause, trigger).await?;
+                    }
+                    None => {
+                        return Err(anyhow::Error::new(status).context("RE channel error"));
+                    }
+                },
+            }
+        }
+    });
+
+    // The action digest is filled in here, downstream of recovery, which keeps
+    // `execute_request` out of `decode_operation` and the reattach closures. No reattach
+    // clones it.
+
+    let stream = stream.map(move |mut r| {
+        match &mut r {
+            Ok(ExecuteWithProgressResponse {
+                execute_response: Some(response),
+                ..
+            }) => {
+                response.action_digest = std::mem::take(&mut execute_request.action_digest);
+            }
+            _ => {}
+        };
+
+        r
+    });
+
+    Ok(stream.boxed())
 }
 
 async fn download_impl<Byt, BytRet, Cas>(
@@ -1838,6 +2021,7 @@ fn substitute_env_vars_impl(
 mod tests {
     use core::sync::atomic::Ordering;
     use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::AtomicUsize;
 
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
@@ -2360,6 +2544,1449 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    fn default_reattach_budget() -> Option<Duration> {
+        Some(Duration::from_secs(EXECUTE_REATTACH_BUDGET_SECS_DEFAULT))
+    }
+
+    fn default_reattach_limiter() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(EXECUTE_REATTACH_CONCURRENCY_DEFAULT))
+    }
+
+    fn fresh_wait_execution_unimplemented_latch() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn test_execute_request(skip_cache_lookup: bool) -> ExecuteRequest {
+        ExecuteRequest {
+            action_digest: TDigest {
+                hash: "aa".to_owned(),
+                size_in_bytes: 3,
+                ..Default::default()
+            },
+            skip_cache_lookup,
+            ..Default::default()
+        }
+    }
+
+    fn any_from(msg: &impl Message) -> prost_types::Any {
+        prost_types::Any {
+            type_url: String::new(),
+            value: msg.encode_to_vec(),
+        }
+    }
+
+    fn progress_operation(name: &str, stage: execution_stage::Value) -> Operation {
+        Operation {
+            name: name.to_owned(),
+            done: false,
+            metadata: Some(any_from(&ExecuteOperationMetadata {
+                stage: stage as i32,
+                ..Default::default()
+            })),
+            result: None,
+        }
+    }
+
+    fn done_operation(name: &str) -> Operation {
+        let action_result = ActionResult {
+            execution_metadata: Some(ExecutedActionMetadata::default()),
+            ..Default::default()
+        };
+        let execute_response = GExecuteResponse {
+            result: Some(action_result),
+            status: Some(Status::default()),
+            ..Default::default()
+        };
+        Operation {
+            name: name.to_owned(),
+            done: true,
+            metadata: None,
+            result: Some(OpResult::Response(any_from(&execute_response))),
+        }
+    }
+
+    fn done_error_operation(name: &str, code: i32, message: &str) -> Operation {
+        Operation {
+            name: name.to_owned(),
+            done: true,
+            metadata: None,
+            result: Some(OpResult::Error(Status {
+                code,
+                message: message.to_owned(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn done_bad_status_operation(name: &str, code: i32, message: &str) -> Operation {
+        let execute_response = GExecuteResponse {
+            result: None,
+            status: Some(Status {
+                code,
+                message: message.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Operation {
+            name: name.to_owned(),
+            done: true,
+            metadata: None,
+            result: Some(OpResult::Response(any_from(&execute_response))),
+        }
+    }
+
+    /// A `tonic::Status` shaped the way tonic itself builds one from a transport-level `io`
+    /// error: the error becomes both the status message and the head of its `source()` chain.
+    fn severed_status(kind: std::io::ErrorKind) -> tonic::Status {
+        tonic::Status::from_error(Box::new(std::io::Error::from(kind)))
+    }
+
+    /// A `tonic::Status` shaped the way tonic itself builds one from an HTTP/2 protocol error:
+    /// the `h2::Error` becomes the head of the status's `source()` chain.
+    fn goaway_status(reason: h2::Reason) -> tonic::Status {
+        tonic::Status::from_error(Box::new(h2::Error::from(reason)))
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_progress_skip_cache_lookup() -> anyhow::Result<()> {
+        for skip_cache_lookup in [true, false] {
+            let req = test_execute_request(skip_cache_lookup);
+
+            let stream = execute_with_progress_impl(
+                &InstanceName(None),
+                req,
+                move |grpc_request| async move {
+                    assert_eq!(grpc_request.skip_cache_lookup, skip_cache_lookup);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                },
+                |_name| async move { panic!("WaitExecution should not be triggered") },
+                default_reattach_budget(),
+                default_reattach_limiter(),
+                fresh_wait_execution_unimplemented_latch(),
+            )
+            .await?;
+
+            let responses: Vec<_> = stream.try_collect().await?;
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].stage, Stage::COMPLETED);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_wait_execution_after_severance() -> anyhow::Result<()> {
+        let action_digest = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let req = ExecuteRequest {
+            action_digest: action_digest.clone(),
+            ..Default::default()
+        };
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![
+                            Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                            Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                        ])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![
+                            Ok(progress_operation(
+                                "op-1",
+                                execution_stage::Value::Executing,
+                            )),
+                            Ok(done_operation("op-1")),
+                        ])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].stage, Stage::QUEUED);
+        assert_eq!(responses[1].stage, Stage::EXECUTING);
+        assert_eq!(responses[2].stage, Stage::COMPLETED);
+        let terminal = responses[2]
+            .execute_response
+            .as_ref()
+            .context("terminal response missing execute_response")?;
+        assert_eq!(terminal.action_digest, action_digest);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_execution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(responses[2].reattach_stats.wait_execution_reattaches, 1);
+        assert_eq!(responses[2].reattach_stats.severed_io, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_uses_latest_operation_name() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_names = Arc::new(Mutex::new(Vec::new()));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_names = wait_execution_names.dupe();
+            move |name: String| {
+                let wait_execution_names = wait_execution_names.dupe();
+                async move {
+                    let call = {
+                        let mut names = wait_execution_names.lock().unwrap();
+                        names.push(name.clone());
+                        names.len()
+                    };
+                    if call == 1 {
+                        anyhow::Ok(
+                            futures::stream::iter(vec![
+                                Ok(progress_operation(
+                                    "op-2",
+                                    execution_stage::Value::Executing,
+                                )),
+                                Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                            ])
+                            .boxed(),
+                        )
+                    } else {
+                        anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-2"))]).boxed())
+                    }
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        assert_eq!(responses.len(), 3);
+
+        let names = wait_execution_names.lock().unwrap().clone();
+        assert_eq!(names, vec!["op-1".to_owned(), "op-2".to_owned()]);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_on_clean_eof() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![Ok(progress_operation(
+                    "op-1",
+                    execution_stage::Value::Queued,
+                ))])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[1].stage, Stage::COMPLETED);
+        assert_eq!(wait_execution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(responses[1].reattach_stats.clean_eof, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_not_found_reissues_execute() -> anyhow::Result<()> {
+        for skip_cache_lookup in [true, false] {
+            let req = test_execute_request(skip_cache_lookup);
+
+            let execute_requests = Arc::new(Mutex::new(Vec::new()));
+            let execute_call_count = Arc::new(AtomicUsize::new(0));
+            let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+            let execute_f = {
+                let execute_requests = execute_requests.dupe();
+                let execute_call_count = execute_call_count.dupe();
+                move |req: GExecuteRequest| {
+                    let execute_requests = execute_requests.dupe();
+                    let execute_call_count = execute_call_count.dupe();
+                    async move {
+                        execute_requests.lock().unwrap().push(req);
+                        let call = execute_call_count.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            anyhow::Ok(
+                                futures::stream::iter(vec![
+                                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                                ])
+                                .boxed(),
+                            )
+                        } else {
+                            anyhow::Ok(
+                                futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed(),
+                            )
+                        }
+                    }
+                }
+            };
+
+            let wait_execution_f = {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                move |name: String| {
+                    let wait_execution_calls = wait_execution_calls.dupe();
+                    async move {
+                        assert_eq!(name, "op-1");
+                        wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<BoxStream<'static, Result<Operation, tonic::Status>>, _>(
+                            anyhow::Error::new(tonic::Status::not_found("operation gone")),
+                        )
+                    }
+                }
+            };
+
+            let stream = execute_with_progress_impl(
+                &InstanceName(None),
+                req,
+                execute_f,
+                wait_execution_f,
+                default_reattach_budget(),
+                default_reattach_limiter(),
+                fresh_wait_execution_unimplemented_latch(),
+            )
+            .await?;
+
+            let responses: Vec<_> = stream.try_collect().await?;
+            let terminal = responses.last().context("expected a terminal response")?;
+            assert_eq!(terminal.stage, Stage::COMPLETED);
+            assert_eq!(terminal.reattach_stats.operation_not_found, 1);
+            assert_eq!(terminal.reattach_stats.re_executes, 1);
+
+            let requests = execute_requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], requests[1]);
+            assert_eq!(wait_execution_calls.load(Ordering::SeqCst), 1);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_call_fails_non_retryably() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<BoxStream<'static, Result<Operation, tonic::Status>>, _>(
+                        anyhow::Error::new(tonic::Status::permission_denied("credentials expired")),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a non-retryable reattach-call failure must propagate immediately");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Reattaching RE execute stream via WaitExecution"),
+            "chain: {chain}"
+        );
+        assert!(chain.contains("credentials expired"), "chain: {chain}");
+        assert!(
+            chain.contains("action `aa`") && chain.contains("operation `op-1`"),
+            "chain does not identify the action and operation being reattached: {chain}"
+        );
+        assert!(
+            !chain.contains("Exceeding RE execute reattach budget"),
+            "a non-retryable reattach failure must not be framed as a budget timeout: {chain}"
+        );
+
+        // The original severance is the root cause: it must appear in the chain, after (not
+        // instead of) the failed WaitExecution attempt that replaced it as the surfaced error.
+        let reattach_position = chain
+            .find("Reattaching RE execute stream via WaitExecution")
+            .context("chain missing the reattach context")?;
+        let severance_position = chain
+            .find("connection reset")
+            .context("chain does not name the original severance as its root cause")?;
+        assert!(
+            reattach_position < severance_position,
+            "the failed WaitExecution attempt must be outer context, the original severance \
+             the root cause: {chain}"
+        );
+
+        assert_eq!(
+            wait_execution_calls.load(Ordering::SeqCst),
+            1,
+            "the reattach call must not be retried once classified non-retryable"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_wait_execution_unimplemented_latches_reattach_off() -> anyhow::Result<()>
+    {
+        let latch = fresh_wait_execution_unimplemented_latch();
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<BoxStream<'static, Result<Operation, tonic::Status>>, _>(
+                        anyhow::Error::new(tonic::Status::unimplemented(
+                            "WaitExecution is not supported",
+                        )),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            test_execute_request(false),
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            latch.dupe(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("an UNIMPLEMENTED WaitExecution reply must still surface an error");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Reattaching RE execute stream via WaitExecution"),
+            "chain: {chain}"
+        );
+        assert!(
+            chain.contains("connection reset"),
+            "chain must name the original severance as its root cause: {chain}"
+        );
+        assert_eq!(
+            wait_execution_calls.load(Ordering::SeqCst),
+            1,
+            "an UNIMPLEMENTED reply must not be retried"
+        );
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "discovering UNIMPLEMENTED must latch reattach off for the client"
+        );
+
+        // A second action sharing the same client hits a fresh severance. The latch must stop
+        // it from ever dialing WaitExecution again.
+        let second_execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-2", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let stream =
+            execute_with_progress_impl(
+                &InstanceName(None),
+                test_execute_request(false),
+                second_execute_f,
+                |_name: String| async move {
+                    panic!("a latched client must never attempt WaitExecution")
+                },
+                default_reattach_budget(),
+                default_reattach_limiter(),
+                latch.dupe(),
+            )
+            .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a severance on a latched client must still propagate an error");
+        assert!(
+            format!("{err:#}").contains("connection reset"),
+            "a latched client propagates the severance trigger unmodified"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_dial_failure_then_recovers() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    let call = wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        Err::<BoxStream<'static, Result<Operation, tonic::Status>>, _>(
+                            anyhow::Error::new(severed_status(
+                                std::io::ErrorKind::ConnectionRefused,
+                            )),
+                        )
+                    } else {
+                        anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                    }
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        let terminal = responses.last().context("expected a terminal response")?;
+        assert_eq!(terminal.stage, Stage::COMPLETED);
+        assert_eq!(terminal.reattach_stats.dial_failures, 1);
+        assert_eq!(terminal.reattach_stats.wait_execution_reattaches, 1);
+        assert_eq!(
+            wait_execution_calls.load(Ordering::SeqCst),
+            2,
+            "a dial failure must retry the same reattach call rather than propagate"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_before_any_message_uses_execute() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    let call = execute_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        anyhow::Ok(
+                            futures::stream::iter(vec![Err(severed_status(
+                                std::io::ErrorKind::ConnectionReset,
+                            ))])
+                            .boxed(),
+                        )
+                    } else {
+                        anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                    }
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move {
+                panic!("WaitExecution should not be triggered before any message is seen")
+            },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].stage, Stage::COMPLETED);
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(responses[0].reattach_stats.re_executes, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_budget_exceeded_fails() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![Err(severed_status(
+                            std::io::ErrorKind::ConnectionReset,
+                        ))])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            Some(Duration::from_secs(5)),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a permanently severed endpoint must eventually fail");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Exceeding RE execute reattach budget"),
+            "chain: {chain}"
+        );
+        assert!(
+            chain.to_lowercase().contains("reset"),
+            "chain does not surface the underlying cause: {chain}"
+        );
+
+        let calls = wait_execution_calls.load(Ordering::SeqCst);
+        assert!(calls > 0, "expected at least one reattach attempt");
+        assert!(
+            calls < 100,
+            "reattach attempts should be budget-bounded, got {calls}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_survives_severance_after_budget_length_silence() -> anyhow::Result<()> {
+        let budget = Duration::from_secs(5);
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        // The QUEUED message lands immediately, resetting the stream's last-progress clock to
+        // t=0. The severance then arrives only after a full budget's worth of silence — the
+        // shape of a long QUEUED action whose disconnect is detected only once TCP keepalive
+        // notices, well after the connection actually died.
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![Ok(progress_operation(
+                    "op-1",
+                    execution_stage::Value::Queued,
+                ))])
+                .chain(futures::stream::once(async move {
+                    tokio::time::sleep(budget).await;
+                    Err(severed_status(std::io::ErrorKind::ConnectionReset))
+                }))
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            Some(budget),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        assert_eq!(
+            responses
+                .last()
+                .context("expected a terminal response")?
+                .stage,
+            Stage::COMPLETED
+        );
+        assert_eq!(
+            wait_execution_calls.load(Ordering::SeqCst),
+            1,
+            "a severance after a budget-length silence must still get a reattach attempt"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reattach_disabled_propagates_trigger_unmodified() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![
+                            Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                            Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                        ])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            None,
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a severed stream must still propagate an error when reattach is disabled");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("RE channel error"),
+            "a disabled client must propagate the same trigger a client built without \
+             reattach would, not a budget-timeout frame: {chain}"
+        );
+        assert!(
+            !chain.contains("Exceeding RE execute reattach budget"),
+            "chain: {chain}"
+        );
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            1,
+            "reattach must never be attempted while disabled"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reattach_disabled_ends_stream_cleanly_on_clean_eof() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![Ok(progress_operation(
+                    "op-1",
+                    execution_stage::Value::Queued,
+                ))])
+                .boxed(),
+            )
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            None,
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        assert_eq!(
+            responses.len(),
+            1,
+            "a disabled client must end the stream on clean EOF exactly as a client built \
+             without reattach would, leaving end-of-stream handling to the consumer"
+        );
+        assert_eq!(responses[0].stage, Stage::QUEUED);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_execute_reattach_concurrency_zero_is_clamped() {
+        let opts = Buck2OssReConfiguration {
+            execute_reattach_concurrency: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            execute_reattach_concurrency(&opts),
+            EXECUTE_REATTACH_CONCURRENCY_MIN,
+            "a configured concurrency of 0 would build a limiter that blocks every reattach \
+             forever"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_limiter_bounds_concurrent_dials() -> anyhow::Result<()> {
+        let limiter = Arc::new(Semaphore::new(1));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        // Both streams sever immediately and race for the same single permit. Each dial holds
+        // the permit for a fixed delay, so two dials overlapping in time would both increment
+        // `concurrent` while the other is still inside its own delay, which a size-1 limiter
+        // prevents.
+        let severed_execute_f = |name: &'static str| {
+            move |_req: GExecuteRequest| async move {
+                anyhow::Ok(
+                    futures::stream::iter(vec![
+                        Ok(progress_operation(name, execution_stage::Value::Queued)),
+                        Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                    ])
+                    .boxed(),
+                )
+            }
+        };
+
+        let stream1 = execute_with_progress_impl(
+            &InstanceName(None),
+            test_execute_request(false),
+            severed_execute_f("op-1"),
+            {
+                let concurrent = concurrent.dupe();
+                let max_concurrent = max_concurrent.dupe();
+                move |name: String| {
+                    let concurrent = concurrent.dupe();
+                    let max_concurrent = max_concurrent.dupe();
+                    async move {
+                        let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_concurrent.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        concurrent.fetch_sub(1, Ordering::SeqCst);
+                        anyhow::Ok(futures::stream::iter(vec![Ok(done_operation(&name))]).boxed())
+                    }
+                }
+            },
+            default_reattach_budget(),
+            limiter.dupe(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let stream2 = execute_with_progress_impl(
+            &InstanceName(None),
+            test_execute_request(false),
+            severed_execute_f("op-2"),
+            {
+                let concurrent = concurrent.dupe();
+                let max_concurrent = max_concurrent.dupe();
+                move |name: String| {
+                    let concurrent = concurrent.dupe();
+                    let max_concurrent = max_concurrent.dupe();
+                    async move {
+                        let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_concurrent.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        concurrent.fetch_sub(1, Ordering::SeqCst);
+                        anyhow::Ok(futures::stream::iter(vec![Ok(done_operation(&name))]).boxed())
+                    }
+                }
+            },
+            default_reattach_budget(),
+            limiter.dupe(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let (r1, r2) = tokio::join!(
+            stream1.try_collect::<Vec<_>>(),
+            stream2.try_collect::<Vec<_>>(),
+        );
+        r1?;
+        r2?;
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "a size-1 limiter must serialize concurrent reattach dials across both streams"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_response_error_propagates_without_retry() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![Ok(done_error_operation(
+                            "op-1",
+                            TCode::INTERNAL.0,
+                            "boom",
+                        ))])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("an application-level operation error must propagate");
+        assert!(format!("{err:#}").contains("boom"));
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_response_bad_status_propagates_without_retry() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![Ok(done_bad_status_operation(
+                            "op-1",
+                            TCode::INVALID_ARGUMENT.0,
+                            "bad request",
+                        ))])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a non-OK ExecuteResponse status must propagate");
+        assert!(format!("{err:#}").contains("bad request"));
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_plain_status_propagates() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![Err(tonic::Status::unavailable(
+                            "backend is down",
+                        ))])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let err = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("a server-spoken status with no h2/io source must propagate");
+        assert!(format!("{err:#}").contains("backend is down"));
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_goaway_no_error_retries() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = move |_req: GExecuteRequest| async move {
+            anyhow::Ok(
+                futures::stream::iter(vec![
+                    Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                    Err(goaway_status(h2::Reason::NO_ERROR)),
+                ])
+                .boxed(),
+            )
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    assert_eq!(name, "op-1");
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let responses: Vec<_> = stream.try_collect().await?;
+        let terminal = responses.last().context("expected a terminal response")?;
+        assert_eq!(terminal.stage, Stage::COMPLETED);
+        assert_eq!(terminal.reattach_stats.severed_goaway, 1);
+        assert_eq!(wait_execution_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_enhance_your_calm_propagates() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![Err(goaway_status(
+                            h2::Reason::ENHANCE_YOUR_CALM,
+                        ))])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .err()
+            .expect("ENHANCE_YOUR_CALM must not be treated as retryable");
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_post_terminal_poll_returns_none() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                }
+            }
+        };
+
+        let mut stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            |_name: String| async move { panic!("WaitExecution should not be triggered") },
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        let first = stream
+            .next()
+            .await
+            .context("expected the terminal response")??;
+        assert_eq!(first.stage, Stage::COMPLETED);
+
+        let second = stream.next().await;
+        assert!(
+            second.is_none(),
+            "a post-terminal poll must not yield another item"
+        );
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reattach_cancelled_during_backoff_sleep() -> anyhow::Result<()> {
+        let req = test_execute_request(false);
+
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let wait_execution_calls = Arc::new(AtomicUsize::new(0));
+
+        let execute_f = {
+            let execute_calls = execute_calls.dupe();
+            move |_req: GExecuteRequest| {
+                let execute_calls = execute_calls.dupe();
+                async move {
+                    execute_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(
+                        futures::stream::iter(vec![
+                            Ok(progress_operation("op-1", execution_stage::Value::Queued)),
+                            Err(severed_status(std::io::ErrorKind::ConnectionReset)),
+                        ])
+                        .boxed(),
+                    )
+                }
+            }
+        };
+
+        let wait_execution_f = {
+            let wait_execution_calls = wait_execution_calls.dupe();
+            move |_name: String| {
+                let wait_execution_calls = wait_execution_calls.dupe();
+                async move {
+                    wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(futures::stream::iter(vec![Ok(done_operation("op-1"))]).boxed())
+                }
+            }
+        };
+
+        let mut stream = execute_with_progress_impl(
+            &InstanceName(None),
+            req,
+            execute_f,
+            wait_execution_f,
+            default_reattach_budget(),
+            default_reattach_limiter(),
+            fresh_wait_execution_unimplemented_latch(),
+        )
+        .await?;
+
+        // The first item is the QUEUED progress message, resolved synchronously from the
+        // scripted stream. Recovery only begins on the next poll, once the severance is read.
+        let first = stream
+            .next()
+            .await
+            .context("expected the initial progress message")??;
+        assert_eq!(first.stage, Stage::QUEUED);
+
+        // Drives the stream to the point where it suspends inside the backoff sleep, without
+        // letting the paused clock auto-advance past it.
+        let mut next = std::pin::pin!(stream.next());
+        let poll = futures::poll!(&mut next);
+        assert!(
+            matches!(poll, std::task::Poll::Pending),
+            "expected the stream to suspend inside the backoff sleep"
+        );
+        drop(stream);
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wait_execution_calls.load(Ordering::SeqCst),
+            0,
+            "dropping the stream during backoff must cancel the pending reattach"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_execute_reattach_budget_resolution() {
+        struct Case {
+            name: &'static str,
+            enabled: Option<bool>,
+            budget_secs: Option<u64>,
+            expected: Option<Duration>,
+        }
+
+        let cases = [
+            Case {
+                name: "defaults to disabled",
+                enabled: None,
+                budget_secs: None,
+                expected: None,
+            },
+            Case {
+                name: "a configured budget alone does not enable reattach",
+                enabled: None,
+                budget_secs: Some(30),
+                expected: None,
+            },
+            Case {
+                name: "explicit enable uses the default budget",
+                enabled: Some(true),
+                budget_secs: None,
+                expected: Some(Duration::from_secs(60)),
+            },
+            Case {
+                name: "explicit enable honors a configured budget",
+                enabled: Some(true),
+                budget_secs: Some(30),
+                expected: Some(Duration::from_secs(30)),
+            },
+            Case {
+                name: "explicit enable with a zero budget still disables",
+                enabled: Some(true),
+                budget_secs: Some(0),
+                expected: None,
+            },
+            Case {
+                name: "explicit disable wins over a configured budget",
+                enabled: Some(false),
+                budget_secs: Some(30),
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let opts = Buck2OssReConfiguration {
+                execute_reattach_enabled: case.enabled,
+                execute_reattach_budget_secs: case.budget_secs,
+                ..Default::default()
+            };
+            assert_eq!(
+                execute_reattach_budget(&opts),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]

@@ -39,6 +39,33 @@ use tower::Service;
 
 use crate::stats::CountingConnector;
 
+/// Default HTTP/2 ping interval, applied when `grpc_keepalive_time_secs` is unset. Field docs on
+/// [`Buck2OssReConfiguration`] describe the behavior this and the other defaults below gate.
+const GRPC_KEEPALIVE_TIME_SECS_DEFAULT: u64 = 600;
+/// Default timeout for an HTTP/2 ping acknowledgement, applied when `grpc_keepalive_timeout_secs`
+/// is unset.
+const GRPC_KEEPALIVE_TIMEOUT_SECS_DEFAULT: u64 = 20;
+/// Default idle time before the first TCP keepalive probe, applied when `tcp_keepalive_time_secs`
+/// is unset.
+const TCP_KEEPALIVE_TIME_SECS_DEFAULT: u64 = 60;
+/// Interval between TCP keepalive probes once the first one fires.
+const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+/// Number of unacknowledged TCP keepalive probes tolerated before the connection is considered
+/// dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Resolves a configured number of seconds against a default: `None` selects `default_secs`, and
+/// `Some(0)` resolves to `None`, disabling the behavior the duration gates.
+pub(crate) fn resolve_optional_secs(
+    configured: Option<u64>,
+    default_secs: u64,
+) -> Option<Duration> {
+    match configured.unwrap_or(default_secs) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 /// Configuration for the connection pool
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -57,6 +84,7 @@ pub struct ChannelConfig {
     grpc_keepalive_time_secs: Option<u64>,
     grpc_keepalive_timeout_secs: Option<u64>,
     grpc_keepalive_while_idle: Option<bool>,
+    tcp_keepalive_time_secs: Option<u64>,
 }
 
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
@@ -101,6 +129,7 @@ impl ChannelConfig {
             grpc_keepalive_time_secs: opts.grpc_keepalive_time_secs,
             grpc_keepalive_timeout_secs: opts.grpc_keepalive_timeout_secs,
             grpc_keepalive_while_idle: opts.grpc_keepalive_while_idle,
+            tcp_keepalive_time_secs: opts.tcp_keepalive_time_secs,
         })
     }
 
@@ -189,26 +218,42 @@ fn create_endpoint(
         endpoint = endpoint.tls_config(tls_config.clone())?;
     }
 
-    // Configure gRPC keepalive settings (always enabled with sensible defaults)
-    endpoint = endpoint
-        .http2_keep_alive_interval(Duration::from_secs(
-            config.grpc_keepalive_time_secs.unwrap_or(30),
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            config.grpc_keepalive_timeout_secs.unwrap_or(10),
-        ))
-        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true));
+    // Configure gRPC HTTP/2 keepalive pings.
+    if let Some(keepalive_time) = resolve_optional_secs(
+        config.grpc_keepalive_time_secs,
+        GRPC_KEEPALIVE_TIME_SECS_DEFAULT,
+    ) {
+        endpoint = endpoint.http2_keep_alive_interval(keepalive_time);
+    }
+    if let Some(keepalive_timeout) = resolve_optional_secs(
+        config.grpc_keepalive_timeout_secs,
+        GRPC_KEEPALIVE_TIMEOUT_SECS_DEFAULT,
+    ) {
+        endpoint = endpoint.keep_alive_timeout(keepalive_timeout);
+    }
+    endpoint = endpoint.keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true));
 
     Ok(endpoint)
 }
 
-/// Create a lazy channel from an endpoint.
-fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
+/// Create a lazy channel from an endpoint. `tcp_keepalive_time` is `None` when TCP keepalive is
+/// disabled; `Some` gives the idle time before the first probe, with the interval between later
+/// probes and the retry count fixed at [`TCP_KEEPALIVE_INTERVAL_SECS`] and
+/// [`TCP_KEEPALIVE_RETRIES`].
+fn channel_from_endpoint(
+    endpoint: &tonic::transport::Endpoint,
+    tcp_keepalive_time: Option<Duration>,
+) -> Channel {
     // Since we are creating the HttpConnector ourselves, any TCP
     // settings (tcp_nodelay, tcp_keepalive, connect_timeout), need to
     // be set here instead of on the endpoint
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    if let Some(tcp_keepalive_time) = tcp_keepalive_time {
+        http.set_keepalive(Some(tcp_keepalive_time));
+        http.set_keepalive_interval(Some(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS)));
+        http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+    }
     let connector = CountingConnector::new(http);
 
     // We need to use a lazy channel so the pool isn't blocked waiting for new
@@ -218,7 +263,11 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
 
 pub fn create_channel(config: &ChannelConfig, address: &str) -> Result<Channel, anyhow::Error> {
     let endpoint = create_endpoint(config, address)?;
-    Ok(channel_from_endpoint(&endpoint))
+    let tcp_keepalive_time = resolve_optional_secs(
+        config.tcp_keepalive_time_secs,
+        TCP_KEEPALIVE_TIME_SECS_DEFAULT,
+    );
+    Ok(channel_from_endpoint(&endpoint, tcp_keepalive_time))
 }
 
 /// A response body wrapper that holds a semaphore permit until the body is fully consumed or dropped.
@@ -363,6 +412,7 @@ struct HostPool {
     endpoint: tonic::transport::Endpoint,
     max_connections: usize,
     max_concurrency_per_connection: usize,
+    tcp_keepalive_time: Option<Duration>,
 }
 
 impl HostPool {
@@ -371,10 +421,11 @@ impl HostPool {
         min_connections: usize,
         max_connections: usize,
         max_concurrency_per_connection: usize,
+        tcp_keepalive_time: Option<Duration>,
     ) -> Self {
         let channel_states: Vec<_> = (0..min_connections)
             .map(|_| {
-                let channel = channel_from_endpoint(&endpoint);
+                let channel = channel_from_endpoint(&endpoint, tcp_keepalive_time);
                 PooledChannelState::new(channel, max_concurrency_per_connection)
             })
             .collect();
@@ -387,6 +438,7 @@ impl HostPool {
             endpoint,
             max_connections,
             max_concurrency_per_connection,
+            tcp_keepalive_time,
         }
     }
 
@@ -410,7 +462,7 @@ impl HostPool {
 
         // All channels at capacity - create new if allowed
         if num_channels < self.max_connections {
-            let channel = channel_from_endpoint(&self.endpoint);
+            let channel = channel_from_endpoint(&self.endpoint, self.tcp_keepalive_time);
             let state = PooledChannelState::new(channel, self.max_concurrency_per_connection);
             let pooled = PooledChannel::new(state.channel.clone(), state.semaphore.clone());
             inner.channels.push(state);
@@ -456,11 +508,16 @@ impl ChannelPool {
                 Entry::Vacant(e) => {
                     let endpoint = create_endpoint(&self.channel_config, address)
                         .with_context(|| format!("Failed to create endpoint for {}", address))?;
+                    let tcp_keepalive_time = resolve_optional_secs(
+                        self.channel_config.tcp_keepalive_time_secs,
+                        TCP_KEEPALIVE_TIME_SECS_DEFAULT,
+                    );
                     let host_pool = HostPool::new(
                         endpoint,
                         self.config.min_connections,
                         self.config.max_connections,
                         self.config.max_concurrency_per_connection,
+                        tcp_keepalive_time,
                     );
                     Arc::clone(e.insert(Arc::new(host_pool)))
                 }

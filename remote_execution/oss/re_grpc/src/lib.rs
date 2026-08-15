@@ -14,6 +14,7 @@ mod error;
 mod grpc;
 mod metadata;
 mod pool;
+mod reattach;
 mod request;
 mod response;
 mod stats;

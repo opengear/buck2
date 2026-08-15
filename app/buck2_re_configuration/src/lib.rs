@@ -463,11 +463,18 @@ pub struct Buck2OssReConfiguration {
     pub find_missing_blobs_batch_size: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
-    /// Interval in seconds for HTTP/2 ping frames to detect stale connections.
+    /// Interval in seconds between HTTP/2 ping frames sent to detect a stale gRPC connection.
+    /// `Some(0)` disables the ping.
+    ///
+    /// Servers may enforce a minimum ping interval and answer a client that pings more often
+    /// with a GOAWAY frame carrying `ENHANCE_YOUR_CALM`. Lower this only against a backend
+    /// known to accept a shorter interval.
     pub grpc_keepalive_time_secs: Option<u64>,
-    /// Timeout in seconds for receiving HTTP/2 ping acknowledgement.
+    /// Timeout in seconds to wait for an HTTP/2 ping acknowledgement before the connection is
+    /// considered dead. `None` resolves to 20 seconds; `Some(0)` disables the timeout.
     pub grpc_keepalive_timeout_secs: Option<u64>,
-    /// Whether to send HTTP/2 pings when connection is idle.
+    /// Whether to send HTTP/2 pings while the connection has no active RPCs. `None` resolves
+    /// to `true`.
     pub grpc_keepalive_while_idle: Option<bool>,
     /// Maximum number of concurrent execution requests.
     pub execution_concurrency_limit: Option<usize>,
@@ -477,6 +484,27 @@ pub struct Buck2OssReConfiguration {
     pub max_connections: Option<usize>,
     /// Maximum concurrent streams per connection.
     pub max_concurrency_per_connection: Option<usize>,
+    /// Idle time in seconds before the first TCP keepalive probe is sent on the connection to
+    /// the RE backend. `Some(0)` disables TCP keepalive.
+    ///
+    /// Probing happens at the transport layer, below the HTTP/2 ping interval
+    /// `grpc_keepalive_time_secs` sets and outside the server-side ping enforcement that
+    /// interval is subject to.
+    pub tcp_keepalive_time_secs: Option<u64>,
+    /// Whether a severed `execute` stream reattaches to the in-flight RE operation instead of
+    /// surfacing the disconnect as a build failure. `None` resolves to `false`.
+    ///
+    /// Enabling this allows a severance arriving before the backend names the operation to
+    /// re-issue `Execute`, which runs the action a second time against a server that does not
+    /// deduplicate in-flight actions by digest.
+    pub execute_reattach_enabled: Option<bool>,
+    /// Wall-clock budget, in seconds, for recovering a severed `execute` stream, measured from
+    /// when recovery for that severance begins. `Some(0)` disables reattach.
+    pub execute_reattach_budget_secs: Option<u64>,
+    /// Upper bound on concurrent `execute`-stream reattach calls across every action sharing
+    /// this client. `Some(0)` is clamped to the minimum of one — a limiter with no permits
+    /// would block every reattach forever.
+    pub execute_reattach_concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -613,6 +641,22 @@ impl Buck2OssReConfiguration {
             max_concurrency_per_connection: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrency_per_connection",
+            })?,
+            tcp_keepalive_time_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "tcp_keepalive_time_secs",
+            })?,
+            execute_reattach_enabled: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "execute_reattach_enabled",
+            })?,
+            execute_reattach_budget_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "execute_reattach_budget_secs",
+            })?,
+            execute_reattach_concurrency: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "execute_reattach_concurrency",
             })?,
         })
     }
