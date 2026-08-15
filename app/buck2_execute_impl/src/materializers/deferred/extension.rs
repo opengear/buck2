@@ -525,4 +525,8 @@ impl<T: IoHandler> DeferredMaterializerExtensions for DeferredMaterializerAccess
                 .buck_error_context("No response from materializer")?,
         ) as _)
     }
+
+    fn clear_tombstoned_test_digests(&self) -> buck2_error::Result<()> {
+        crate::materializers::deferred::io_handler::clear_tombstoned_test_digests()
+    }
 }

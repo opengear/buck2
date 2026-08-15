@@ -25,6 +25,7 @@ use buck2_common::events::HasEvents;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::soft_error;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::ActionErrorDiagnostics;
 use buck2_data::ActionSubErrors;
@@ -778,6 +779,9 @@ fn apply_cas_missing_recovery_outcome(
             "digest missing from the RE CAS resolved to no producing action; CAS-missing recovery cannot repair it"
         );
     }
+    if !outcome.producing_actions.is_empty() {
+        report_recoverable_by_command_retry(outcome.producing_actions.len());
+    }
 
     // The console reads this guidance from its own event. Converting an `ActionError` into a
     // `buck2_error::Error` rebuilds the error from the action's formatted message and keeps only
@@ -788,6 +792,30 @@ fn apply_cas_missing_recovery_outcome(
         action_outputs,
         error: Some(inner.context(outcome.guidance)),
     }
+}
+
+/// Reports this failure to the client as recoverable by an automatic same-daemon command retry:
+/// the daemon armed at least one producing action for re-execution, so retrying the same command
+/// once that action re-executes is expected to succeed.
+///
+/// This is a distinct `StructuredError` event from the one the CAS-missing error itself raised at
+/// the point it was first detected. Attribution runs after that event already fired: upload and
+/// download failure sites report a digest missing before any caller has attempted to resolve it
+/// to a producing action, so only this later point in the failure's handling knows whether
+/// recovery found one.
+fn report_recoverable_by_command_retry(producing_action_count: usize) {
+    let notice = buck2_error::buck2_error!(
+        buck2_error::ErrorTag::ReCasArtifactMissingRecoverable,
+        "queued {} action(s) for CAS-missing repair",
+        producing_action_count,
+    );
+    let _ignored = soft_error!(
+        "cas_missing_recovery_queued",
+        notice,
+        quiet: true,
+        task: false,
+        recoverable_by_command_retry: true,
+    );
 }
 
 /// Attaches the outcome of CAS-missing recovery to `error`, arming producing actions in the

@@ -223,6 +223,7 @@ mod imp {
             daemon_materializer_state_is_corrupted: options.daemon_materializer_state_is_corrupted,
             action_cache_is_corrupted: options.action_cache_is_corrupted,
             deprecation: options.deprecation,
+            recoverable_by_command_retry: options.recoverable_by_command_retry,
         }
     }
 

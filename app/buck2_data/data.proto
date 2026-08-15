@@ -612,6 +612,9 @@ message StructuredError {
   bool action_cache_is_corrupted = 10;
   // Whether the error should be converted to a hard error in the future.
   bool deprecation = 11;
+  // Whether the daemon addressed the cause of this failure, so retrying the
+  // same command against the same daemon is expected to succeed.
+  bool recoverable_by_command_retry = 12;
 }
 
 message CriticalPathEntry {
@@ -3523,6 +3526,12 @@ message ReleaseLocalResourcesEnd {}
 
 message RestartConfiguration {
   bool enable_restarter = 1;
+  // Whether the client should automatically retry a command against the same
+  // daemon when the daemon reports the failure as recoverable by retry.
+  bool enable_command_retry_on_recoverable_failure = 2;
+  // The number of automatic same-daemon retries the client may perform for
+  // one invocation before treating a recoverable failure as final.
+  uint32 max_command_retries_on_recoverable_failure = 3;
 }
 
 // Events capturing commands to the deferred materializer.

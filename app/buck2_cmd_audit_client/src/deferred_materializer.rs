@@ -48,6 +48,9 @@ pub enum DeferredMaterializerSubcommand {
         count: usize,
     },
     FlushAccessTimes,
+    /// Clear digests injected by BUCK2_TEST_TOMBSTONED_DIGESTS as missing from the RE CAS, so a
+    /// later materialization request for any of them reaches the real RE CAS.
+    ClearTombstonedTestDigests,
 }
 
 #[async_trait]

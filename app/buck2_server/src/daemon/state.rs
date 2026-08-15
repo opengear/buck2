@@ -189,6 +189,11 @@ pub struct DaemonStateData {
     /// failure fatal.
     pub cas_missing_recovery_max_action_attempts: u32,
 
+    /// The number of times the client automatically retries a command against this daemon after
+    /// a failure the daemon reported as recoverable by retry, before treating the failure as
+    /// final.
+    pub cas_missing_recovery_max_command_retries: u32,
+
     /// Actions whose declared CAS output was reported missing during execution, tracked for the
     /// daemon's lifetime so the next DICE transaction can invalidate them for recovery.
     pub cas_missing_recovery_registry: Arc<CasMissingRecoveryRegistry>,
@@ -701,6 +706,13 @@ impl DaemonState {
                 })?
                 .unwrap_or(2);
 
+            let cas_missing_recovery_max_command_retries = root_config
+                .parse::<u32>(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "cas_missing_recovery_max_command_retries",
+                })?
+                .unwrap_or(1);
+
             let paranoid = if init_ctx.daemon_startup_config.paranoid {
                 Some(ParanoidDownloader::new(
                     fs.clone(),
@@ -787,6 +799,7 @@ impl DaemonState {
                 enable_restarter,
                 cas_missing_recovery_enabled,
                 cas_missing_recovery_max_action_attempts,
+                cas_missing_recovery_max_command_retries,
                 cas_missing_recovery_registry: Arc::new(CasMissingRecoveryRegistry::new()),
                 http_client,
                 paranoid,
@@ -895,6 +908,9 @@ impl DaemonState {
 
         dispatcher.instant_event(buck2_data::RestartConfiguration {
             enable_restarter: data.enable_restarter,
+            enable_command_retry_on_recoverable_failure: data.cas_missing_recovery_enabled,
+            max_command_retries_on_recoverable_failure: data
+                .cas_missing_recovery_max_command_retries,
         });
 
         tag_result!(

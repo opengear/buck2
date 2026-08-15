@@ -230,17 +230,39 @@ fn main() -> ! {
         }
     }
 
+    /// Re-executes the command in-process for as long as one of three reasons keeps applying:
+    /// the `FORCE_WANT_RESTART` test-only escape hatch, a daemon-rejecting restart, or a
+    /// same-daemon command retry.
+    ///
+    /// The three reasons have different budgets. `FORCE_WANT_RESTART` and a daemon-rejecting
+    /// restart each fire at most once per invocation chain: a fresh daemon is expected to
+    /// resolve its own corruption in that one attempt. A same-daemon command retry reuses the
+    /// same daemon deliberately, so it repeats up to the budget `Restarter` tracks for it.
     fn maybe_restart(
         first_trace_id: TraceId,
         initial_result: ExitResult,
         shared: SharedProcessContext,
         runtime: &mut ClientRuntime,
     ) -> ExitResult {
-        let force_want_restart = shared.force_want_restart;
-        let restart = |res| {
-            let restart_start_time = SystemTime::now();
+        let mut force_this_attempt = shared.force_want_restart;
+        let mut daemon_reject_shot_spent = false;
+        let mut shared = shared;
+        let mut res = initial_result;
+        let mut previous_trace_id = first_trace_id;
 
-            if !force_want_restart && !shared.restarter.should_restart() {
+        loop {
+            let daemon_reject_wanted =
+                !daemon_reject_shot_spent && shared.restarter.daemon_rejecting_restart_wanted();
+            let command_retry_wanted = !res.is_success() && shared.restarter.command_retry_wanted();
+            let attempt_restart =
+                force_this_attempt || daemon_reject_wanted || command_retry_wanted;
+
+            force_this_attempt = false;
+            if daemon_reject_wanted {
+                daemon_reject_shot_spent = true;
+            }
+
+            if !attempt_restart {
                 tracing::debug!("No restart was requested");
                 return res;
             }
@@ -255,20 +277,21 @@ fn main() -> ! {
                 return res;
             }
 
-            let (_, res) = exec_with_logging(
-                TraceId::new(),
+            let restart_start_time = SystemTime::now();
+            let new_trace_id = TraceId::new();
+            let (new_shared, new_res) = exec_with_logging(
+                new_trace_id.dupe(),
                 restart_start_time,
-                Some(first_trace_id),
+                Some(previous_trace_id.dupe()),
                 Ok(shared),
                 runtime,
             );
-            res
-        };
-
-        if force_want_restart {
-            restart(initial_result)
-        } else {
-            initial_result.or_else(restart)
+            previous_trace_id = new_trace_id;
+            res = new_res;
+            shared = match new_shared {
+                Some(s) => s,
+                None => return res,
+            };
         }
     }
 
