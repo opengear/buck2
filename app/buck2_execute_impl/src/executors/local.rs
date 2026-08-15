@@ -31,7 +31,6 @@ use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
-use buck2_core::tag_error;
 use buck2_core::tag_result;
 use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
@@ -67,11 +66,13 @@ use buck2_execute::execute::request::NetworkAccess;
 use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
+use buck2_execute::materialize::materializer::CasMissingRecoveryGuidance;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::Materializer;
+use buck2_execute::materialize::materializer::cas_not_found_fatal_error;
 use buck2_execute_local::CommandResult;
 use buck2_execute_local::DefaultKillProcess;
 use buck2_execute_local::GatherOutputStatus;
@@ -1438,21 +1439,18 @@ pub async fn materialize_inputs(
     )
     .await?;
 
+    let recovery = if request.cas_missing_recovery_enabled() {
+        CasMissingRecoveryGuidance::RecoveryEnabled
+    } else {
+        CasMissingRecoveryGuidance::RestartRequired
+    };
+
     let mut stream = materializer.materialize_many(paths.clone()).await?;
     while let Some(res) = stream.next().await {
         match res {
             Ok(()) => {}
             Err(MaterializationError::NotFound { source }) => {
-                let corrupted = source.info.origin.guaranteed_by_action_cache();
-
-                return Err(tag_error!(
-                    "cas_missing_fatal",
-                    MaterializationError::NotFound { source }.into(),
-                    quiet: true,
-                    task: false,
-                    daemon_in_memory_state_is_corrupted: true,
-                    action_cache_is_corrupted: corrupted
-                ));
+                return Err(cas_not_found_fatal_error(source, recovery));
             }
             Err(e) => {
                 return Err(e.into());

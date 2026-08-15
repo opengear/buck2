@@ -33,6 +33,7 @@ use buck2_execute::re::action_identity::ReActionIdentity;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::ActionCacheResult;
+use buck2_execute::re::uploader::CasMissingRecovery;
 use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
@@ -120,6 +121,11 @@ async fn query_action_cache_and_download_result(
                 identity,
                 digest_config,
                 deduplicate_get_digests_ttl_calls,
+                // CAS-missing recovery attributes a repair to the action whose input digest
+                // went missing during that action's own execution attempt. This debug-only
+                // path uploads every action's blobs for cache warm-up, outside any single
+                // action's execution attempt, so recovery attributes nothing to it.
+                CasMissingRecovery::Disabled,
             )
             .await
         {
@@ -242,6 +248,10 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
         manager: CommandExecutionManager,
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        if command.request.skip_cache_lookup() {
+            return ControlFlow::Continue(manager);
+        }
+
         let action_digest = &command.prepared_action.action_and_blobs.action;
         let details = RemoteCommandExecutionDetails::new(
             action_digest.dupe(),
@@ -299,6 +309,10 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
         manager: CommandExecutionManager,
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        if command.request.skip_cache_lookup() {
+            return ControlFlow::Continue(manager);
+        }
+
         // If the remote dep file key is not set, just fallback to the next execution method
         let remote_dep_file_key = match command.request.remote_dep_file_key() {
             None => {

@@ -82,6 +82,8 @@ use remote_execution::TActionResult2;
 use crate::actions::ActionExecutionCtx;
 use crate::actions::RegisteredAction;
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
+use crate::actions::cas_missing_recovery::CasRecoveryBatch;
+use crate::actions::cas_missing_recovery::HasCasRecoveryBatch;
 use crate::actions::execute::action_execution_target::ActionExecutionTarget;
 use crate::actions::execute::dice_data::CommandExecutorResponse;
 use crate::actions::execute::dice_data::DiceHasCommandExecutor;
@@ -297,6 +299,7 @@ impl HasActionExecutor for DiceComputations<'_> {
         let http_client = self.per_transaction_data().get_http_client();
         let mergebase = self.per_transaction_data().get_mergebase();
         let invalidation_tracking_enabled = self.get_invalidation_tracking_config().enabled;
+        let cas_recovery_batch = self.per_transaction_data().get_cas_recovery_batch();
 
         Ok(Arc::new(BuckActionExecutor::new(
             CommandExecutor::new(
@@ -319,6 +322,7 @@ impl HasActionExecutor for DiceComputations<'_> {
             mergebase,
             invalidation_tracking_enabled,
             output_trees_download_config,
+            cas_recovery_batch,
         )))
     }
 }
@@ -336,6 +340,10 @@ pub struct BuckActionExecutor {
     mergebase: Mergebase,
     invalidation_tracking_enabled: bool,
     output_trees_download_config: OutputTreesDownloadConfig,
+    /// The actions this DICE transaction invalidated for CAS-missing recovery. Populated only
+    /// when `buck2.cas_missing_recovery` is enabled and this transaction drained the recovery
+    /// registry.
+    cas_recovery_batch: CasRecoveryBatch,
 }
 
 impl BuckActionExecutor {
@@ -352,6 +360,7 @@ impl BuckActionExecutor {
         mergebase: Mergebase,
         invalidation_tracking_enabled: bool,
         output_trees_download_config: OutputTreesDownloadConfig,
+        cas_recovery_batch: CasRecoveryBatch,
     ) -> Self {
         BuckActionExecutor {
             command_executor,
@@ -366,6 +375,7 @@ impl BuckActionExecutor {
             mergebase,
             invalidation_tracking_enabled,
             output_trees_download_config,
+            cas_recovery_batch,
         }
     }
 
@@ -384,6 +394,17 @@ impl BuckActionExecutor {
     pub(crate) fn is_full_hybrid_enabled(&self) -> bool {
         self.command_executor.is_full_hybrid_enabled()
     }
+
+    /// Knobs controlling how this transaction's actions run, including whether CAS-missing
+    /// recovery is enabled.
+    pub fn run_action_knobs(&self) -> &RunActionKnobs {
+        &self.run_action_knobs
+    }
+
+    /// The actions this transaction invalidated for CAS-missing recovery.
+    pub fn cas_recovery_batch(&self) -> &CasRecoveryBatch {
+        &self.cas_recovery_batch
+    }
 }
 
 struct BuckActionExecutionContext<'a> {
@@ -398,7 +419,7 @@ struct BuckActionExecutionContext<'a> {
 #[async_trait]
 impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
     fn target(&self) -> ActionExecutionTarget<'_> {
-        ActionExecutionTarget::new(self.action)
+        ActionExecutionTarget::new(self.action, self.executor.cas_recovery_batch.dupe())
     }
 
     fn fs(&self) -> &ArtifactFs {
@@ -894,6 +915,7 @@ mod tests {
     use crate::actions::ExecuteError;
     use crate::actions::RegisteredAction;
     use crate::actions::box_slice_set::BoxSliceSet;
+    use crate::actions::cas_missing_recovery::CasRecoveryBatch;
     use crate::actions::execute::action_executor::ActionExecutionKind;
     use crate::actions::execute::action_executor::ActionExecutionMetadata;
     use crate::actions::execute::action_executor::ActionOutputs;
@@ -960,6 +982,7 @@ mod tests {
             Default::default(),
             true,
             OutputTreesDownloadConfig::new(None, true),
+            CasRecoveryBatch::empty(),
         );
 
         #[derive(Debug, Allocative, PagablePanic)] // test

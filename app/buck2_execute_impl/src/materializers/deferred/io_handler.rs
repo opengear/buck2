@@ -39,7 +39,9 @@ use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::IoRequest;
 use buck2_execute::execute::clean_output_paths::cleanup_path;
+use buck2_execute::execute::missing_cas_digests::MissingCasDigests;
 use buck2_execute::materialize::http::http_download;
+use buck2_execute::materialize::materializer::CasMissingRecoveryGuidance;
 use buck2_execute::materialize::materializer::CasNotFoundError;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_execute::materialize::utils::dynamic_priority_handle::DynamicPriorityHandle;
@@ -259,10 +261,17 @@ impl DefaultIoHandler {
                     .await
                     .map_err(|e| match e.find_typed_context::<RemoteExecutionError>() {
                         Some(re_error) if re_error.code == TCode::NOT_FOUND => {
+                            let e: buck2_error::Error = e.into();
+                            let missing = collect_entry_digests(&path, &entry);
+                            let e = e.context(MissingCasDigests { missing });
                             MaterializeEntryError::NotFound(CasNotFoundError {
                                 path: Arc::from(path),
                                 info: info.dupe(),
                                 directory: entry,
+                                // The caller that decides this failure is fatal knows whether
+                                // CAS-missing recovery could attribute it to a producing action,
+                                // and replaces this placeholder with the guidance that matches.
+                                recovery: CasMissingRecoveryGuidance::RestartRequired,
                                 error: Arc::from(e),
                             })
                         }
@@ -610,6 +619,27 @@ impl IoHandler for NoDiskIoHandler {
     fn digest_config(&self) -> DigestConfig {
         self.digest_config
     }
+}
+
+/// Every file digest reachable from `entry`, paired with its path under `base`, in the
+/// canonical `hash:size` form.
+///
+/// Used to attribute a CAS-missing materialization failure back to its producing action: RE
+/// reports only that the download as a whole was not found, not which digest within it, but
+/// every digest in `entry` belongs to the one artifact declared at `base`, so listing them all
+/// is safe even though only one of them may be the actual cause.
+fn collect_entry_digests(
+    base: &ProjectRelativePathBuf,
+    entry: &ActionDirectoryEntry<ActionSharedDirectory>,
+) -> Vec<(ProjectRelativePathBuf, String)> {
+    let mut missing = Vec::new();
+    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
+    while let Some((path, entry)) = walk.next() {
+        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) = entry {
+            missing.push((base.join(path.get()), f.digest.to_string()));
+        }
+    }
+    missing
 }
 
 /// This is used for testing to ingest digests (via BUCK2_TEST_TOMBSTONED_DIGESTS).

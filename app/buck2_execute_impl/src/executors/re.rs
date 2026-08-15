@@ -94,6 +94,10 @@ pub struct ReExecutor {
     pub deduplicate_get_digests_ttl_calls: bool,
     pub output_trees_download_config: OutputTreesDownloadConfig,
     pub priority: Option<i32>,
+    /// When enabled, a CAS-missing input upload failure re-probes the CAS for exactly the
+    /// digests reported missing and reports any digest still absent as recoverable. When
+    /// disabled, the action-age heuristic alone decides whether the failure is fatal.
+    pub cas_missing_recovery_enabled: bool,
 }
 
 impl ReExecutor {
@@ -118,6 +122,7 @@ impl ReExecutor {
                     Some(identity),
                     digest_config,
                     self.deduplicate_get_digests_ttl_calls,
+                    self.cas_missing_recovery_enabled.into(),
                 )
                 .await;
             match res {
@@ -171,6 +176,7 @@ impl ReExecutor {
         re_gang_workers: &[buck2_core::execution_types::executor_config::ReGangWorker],
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
+        skip_cache_read: bool,
     ) -> ControlFlow<CommandExecutionResult, (CommandExecutionManager, ExecuteResponseWithQueueStats)>
     {
         info!(
@@ -188,7 +194,7 @@ impl ReExecutor {
             re_gang_workers,
             identity,
             &mut manager,
-            self.skip_cache_read,
+            skip_cache_read,
             self.skip_cache_write,
             self.re_max_queue_time,
             self.re_resource_units,
@@ -440,6 +446,11 @@ impl PreparedCommandExecutor for ReExecutor {
             .cloned()
             .collect();
 
+        // A CAS-missing recovery re-run must bypass the RE cache lookup: it would hand back the
+        // action result that references the digest reported missing, making the re-run a no-op
+        // instead of a repair.
+        let skip_cache_read = self.skip_cache_read || request.skip_cache_lookup();
+
         let (manager, response) = self
             .re_execute(
                 manager,
@@ -454,6 +465,7 @@ impl PreparedCommandExecutor for ReExecutor {
                 &re_gang_workers,
                 command.request.meta_internal_extra_params(),
                 worker_tool_action_digest,
+                skip_cache_read,
             )
             .await?;
 

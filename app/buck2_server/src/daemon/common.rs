@@ -97,6 +97,7 @@ pub struct CommandExecutorFactory {
     deduplicate_get_digests_ttl_calls: bool,
     output_trees_download_config: OutputTreesDownloadConfig,
     daemon_id: DaemonId,
+    cas_missing_recovery_enabled: bool,
 }
 
 impl CommandExecutorFactory {
@@ -123,6 +124,7 @@ impl CommandExecutorFactory {
         deduplicate_get_digests_ttl_calls: bool,
         output_trees_download_config: OutputTreesDownloadConfig,
         daemon_id: DaemonId,
+        cas_missing_recovery_enabled: bool,
     ) -> Self {
         let cache_upload_permission_checker = Arc::new(ActionCacheUploadPermissionChecker::new());
 
@@ -151,6 +153,7 @@ impl CommandExecutorFactory {
             deduplicate_get_digests_ttl_calls,
             output_trees_download_config,
             daemon_id,
+            cas_missing_recovery_enabled,
         }
     }
 
@@ -252,6 +255,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 deduplicate_get_digests_ttl_calls: self.deduplicate_get_digests_ttl_calls,
                 output_trees_download_config: self.output_trees_download_config.dupe(),
                 priority,
+                cas_missing_recovery_enabled: self.cas_missing_recovery_enabled,
             }
         };
 

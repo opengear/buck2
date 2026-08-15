@@ -19,17 +19,23 @@ use derivative::Derivative;
 use dupe::Dupe;
 
 use crate::actions::RegisteredAction;
+use crate::actions::cas_missing_recovery::CasRecoveryBatch;
 
 /// Indicates why we are executing a given command.
 #[derive(Clone, Dupe, Derivative)]
 #[derivative(Debug)]
 pub struct ActionExecutionTarget<'a> {
     action: &'a RegisteredAction,
+    #[derivative(Debug = "ignore")]
+    cas_recovery_batch: CasRecoveryBatch,
 }
 
 impl<'a> ActionExecutionTarget<'a> {
-    pub(crate) fn new(action: &'a RegisteredAction) -> Self {
-        ActionExecutionTarget { action }
+    pub(crate) fn new(action: &'a RegisteredAction, cas_recovery_batch: CasRecoveryBatch) -> Self {
+        ActionExecutionTarget {
+            action,
+            cas_recovery_batch,
+        }
     }
 
     pub fn owner(&self) -> &'a BaseDeferredKey {
@@ -53,6 +59,16 @@ impl<'a> ActionExecutionTarget<'a> {
             self.action.all_outputs_are_content_based(),
         )
         .unwrap()
+    }
+
+    /// Whether this action's execution must bypass every cache lookup — the action cache, the RE
+    /// cache, and the remote and local dep-file caches — and execute unconditionally.
+    ///
+    /// CAS-missing recovery invalidated this action for repair: any cached result would hand
+    /// back the digest that was reported missing, making a cache-served re-run a no-op instead
+    /// of a repair.
+    pub fn should_skip_cache_lookup(&self) -> bool {
+        self.cas_recovery_batch.contains(self.action.key())
     }
 }
 

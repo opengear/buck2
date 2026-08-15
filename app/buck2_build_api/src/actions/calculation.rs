@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::iter::zip;
@@ -29,13 +30,21 @@ use buck2_data::ActionErrorDiagnostics;
 use buck2_data::ActionSubErrors;
 use buck2_data::ToProtoMessage;
 use buck2_data::get_action_digest;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_directory::directory::walk::unordered_entry_walk;
 use buck2_error::BuckErrorContext;
 use buck2_event_observer::action_util::get_execution_time_ms;
 use buck2_events::dispatch::async_record_root_spans;
+use buck2_events::dispatch::console_message;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::span_async;
 use buck2_events::span::SpanId;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
+use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::directory::ActionDirectoryMember;
+use buck2_execute::execute::missing_cas_digests::MissingCasDigests;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::output_size::OutputSize;
@@ -47,6 +56,7 @@ use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::DiceTrackedInvalidationPath;
+use dice::DiceTransactionUpdater;
 use dice::Key;
 use dice::OkPagableValueSerialize;
 use dice::ValueSerialize;
@@ -60,9 +70,14 @@ use ref_cast::RefCast;
 use smallvec::SmallVec;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
+use tracing::debug;
+use tracing::warn;
 
 use crate::actions::RegisteredAction;
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
+use crate::actions::cas_missing_recovery::CasMissingRecoveryRegistry;
+use crate::actions::cas_missing_recovery::CasRecoveryBatch;
+use crate::actions::cas_missing_recovery::HasCasMissingRecoveryRegistry;
 use crate::actions::error::ActionError;
 use crate::actions::error_handler::ActionErrorHandlerError;
 use crate::actions::error_handler::ActionSubErrorResult;
@@ -71,6 +86,7 @@ use crate::actions::execute::action_executor::ActionOutputs;
 use crate::actions::execute::action_executor::BuckActionExecutor;
 use crate::actions::execute::action_executor::HasActionExecutor;
 use crate::actions::execute::error::ExecuteError;
+use crate::actions::impls::run_action_knobs::RunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
 use crate::artifact_groups::calculation::ensure_artifact_group_staged;
@@ -301,9 +317,15 @@ async fn build_action_inner(
         }
         None => buck2_data::ExpectedEligibleForDedupe::UnknownEligibility,
     };
+
+    let inputs_for_recovery =
+        inputs_for_cas_missing_recovery(executor.run_action_knobs(), &ensured_inputs);
+
     let (execute_result, command_reports) = executor
         .execute(waiting_data, ensured_inputs, action, cancellation)
         .await;
+
+    record_cas_missing_recovery_repair(ctx, executor, action);
 
     let allow_omit_details = execute_result.is_ok();
 
@@ -401,6 +423,8 @@ async fn build_action_inner(
             hostname = buck2_events::metadata::hostname();
 
             let last_command = commands.last().cloned();
+
+            let e = attach_cas_missing_recovery_outcome(ctx, e, inputs_for_recovery.as_ref());
 
             let outputs = match &e {
                 ExecuteError::CommandExecutionError { action_outputs, .. } => {
@@ -592,6 +616,225 @@ fn check_infra_error_patterns(
         .iter()
         .find(|(pattern, _)| stderr_lower.contains(pattern))
         .map(|(_, tag)| *tag)
+}
+
+/// Builds an index from each input's canonical `hash:size` digest to the `ActionKey` of the
+/// action that produced it, so a CAS-missing failure on one of these inputs can identify which
+/// action to repair.
+///
+/// Source artifacts have no producing action and contribute nothing to the index. A digest that
+/// resolves to none of this action's inputs reaches the fatal path unchanged, and fails the build
+/// exactly as it would without CAS-missing recovery.
+fn index_missing_digest_candidates(
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+) -> HashMap<String, ActionKey> {
+    let mut index = HashMap::new();
+    for group_values in ensured_inputs.values() {
+        for (artifact, value) in group_values.iter() {
+            let Some(action_key) = artifact.action_key() else {
+                continue;
+            };
+            index_artifact_value_digests(value, action_key, &mut index);
+        }
+    }
+    index
+}
+
+/// Indexes every digest reachable from `value` (its own root digest, and every file digest in
+/// its directory tree for a tree artifact) against `action_key`.
+fn index_artifact_value_digests(
+    value: &ArtifactValue,
+    action_key: &ActionKey,
+    index: &mut HashMap<String, ActionKey>,
+) {
+    if let Some(digest) = value.digest() {
+        index
+            .entry(digest.to_string())
+            .or_insert_with(|| action_key.dupe());
+    }
+
+    let mut walk = unordered_entry_walk(value.entry().as_ref().map_dir(Directory::as_ref));
+    while let Some((_, entry)) = walk.next() {
+        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
+            index
+                .entry(file.digest.to_string())
+                .or_insert_with(|| action_key.dupe());
+        }
+    }
+}
+
+/// The guidance shown to the user when CAS-missing recovery identified at least one producing
+/// action and armed it for re-execution on the next build.
+const CAS_MISSING_RECOVERY_QUEUED: &str = "Buck2 identified the action(s) that produced these \
+    artifacts and queued them for re-execution on your next build.";
+
+/// The guidance shown to the user when CAS-missing recovery could not identify a producing action
+/// for any of the missing digests, so the failure is fatal and the daemon's in-memory state is
+/// unaffected by the failure.
+const CAS_MISSING_RECOVERY_UNATTRIBUTED: &str = "This error is currently unrecoverable. To \
+    proceed, you should restart Buck using `buck2 killall`.";
+
+/// What CAS-missing recovery determined for one failure: which producing actions to arm for
+/// re-execution, which missing digests resolved to no producing action, and the guidance that
+/// matches the outcome.
+struct CasMissingRecoveryOutcome {
+    producing_actions: Vec<ActionKey>,
+    unattributed: Vec<(ProjectRelativePathBuf, String)>,
+    guidance: &'static str,
+}
+
+/// Resolves the digests a CAS-missing failure reported against an index built from
+/// `ensured_inputs`, deciding which producing actions recovery can arm and what guidance the
+/// outcome warrants.
+///
+/// A digest that resolves to no producing action is not an error on its own: it is an input this
+/// action didn't declare, or a digest for which the daemon has no producing action on record. It
+/// only changes the guidance when none of the failure's digests resolve to a producing action, at
+/// which point recovery has nothing to arm and the failure stays fatal.
+fn resolve_cas_missing_recovery_outcome(
+    missing: &MissingCasDigests,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+) -> CasMissingRecoveryOutcome {
+    let digest_to_producing_action = index_missing_digest_candidates(ensured_inputs);
+
+    let mut producing_actions = Vec::new();
+    let mut unattributed = Vec::new();
+    for (path, digest) in &missing.missing {
+        match digest_to_producing_action.get(digest) {
+            Some(action) => producing_actions.push(action.dupe()),
+            None => unattributed.push((path.clone(), digest.clone())),
+        }
+    }
+
+    let guidance = if producing_actions.is_empty() {
+        CAS_MISSING_RECOVERY_UNATTRIBUTED
+    } else {
+        CAS_MISSING_RECOVERY_QUEUED
+    };
+
+    CasMissingRecoveryOutcome {
+        producing_actions,
+        unattributed,
+        guidance,
+    }
+}
+
+/// Retains the action's inputs for CAS-missing attribution, and does so only for a build that
+/// opted into recovery.
+///
+/// `ensured_inputs` is moved into the executor, so attribution needs its own handle on the map.
+/// `ArtifactGroupValues` is `Arc`-backed, making the clone a reference-count bump per input group
+/// rather than a walk of every artifact's digest tree, and the digest index that attribution
+/// walks is built in the error branch, leaving a successful action paying for the clone alone.
+fn inputs_for_cas_missing_recovery(
+    knobs: &RunActionKnobs,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+) -> Option<BuckIndexMap<ArtifactGroup, ArtifactGroupValues>> {
+    knobs
+        .cas_missing_recovery_enabled
+        .then(|| ensured_inputs.clone())
+}
+
+/// Attaches the outcome of CAS-missing recovery to `error`: arms every producing action it
+/// identified in `registry`, and replaces the upload-time placeholder guidance with the one that
+/// matches what recovery actually determined for this failure.
+///
+/// A build that did not opt into recovery leaves `inputs_for_recovery` `None`, so this returns
+/// the error exactly as the executor produced it, leaving the registry empty. This function
+/// treats an error as a CAS-missing failure only when it holds a [`MissingCasDigests`] context;
+/// every other error returns unchanged.
+fn apply_cas_missing_recovery_outcome(
+    registry: &CasMissingRecoveryRegistry,
+    error: ExecuteError,
+    inputs_for_recovery: Option<&BuckIndexMap<ArtifactGroup, ArtifactGroupValues>>,
+) -> ExecuteError {
+    let Some(ensured_inputs) = inputs_for_recovery else {
+        return error;
+    };
+    let ExecuteError::CommandExecutionError {
+        action_outputs,
+        error: Some(inner),
+    } = error
+    else {
+        return error;
+    };
+    let Some(missing) = inner.find_typed_context::<MissingCasDigests>() else {
+        return ExecuteError::CommandExecutionError {
+            action_outputs,
+            error: Some(inner),
+        };
+    };
+
+    let outcome = resolve_cas_missing_recovery_outcome(&missing, ensured_inputs);
+
+    for action in &outcome.producing_actions {
+        debug!(action = %action, "arming action for CAS-missing recovery");
+        registry.record_missing(action.dupe());
+    }
+    for (path, digest) in &outcome.unattributed {
+        warn!(
+            path = %path,
+            digest = %digest,
+            "digest missing from the RE CAS resolved to no producing action; CAS-missing recovery cannot repair it"
+        );
+    }
+
+    // The console reads this guidance from its own event. Converting an `ActionError` into a
+    // `buck2_error::Error` rebuilds the error from the action's formatted message and keeps only
+    // its tags, so context attached here reaches the build report but never the terminal.
+    console_message(outcome.guidance.to_owned());
+
+    ExecuteError::CommandExecutionError {
+        action_outputs,
+        error: Some(inner.context(outcome.guidance)),
+    }
+}
+
+/// Attaches the outcome of CAS-missing recovery to `error`, arming producing actions in the
+/// daemon-lifetime registry attached to this DICE transaction.
+///
+/// See [`apply_cas_missing_recovery_outcome`] for which failures recovery acts on.
+fn attach_cas_missing_recovery_outcome(
+    ctx: &DiceComputations<'_>,
+    error: ExecuteError,
+    inputs_for_recovery: Option<&BuckIndexMap<ArtifactGroup, ArtifactGroupValues>>,
+) -> ExecuteError {
+    let registry = ctx
+        .per_transaction_data()
+        .get_cas_missing_recovery_registry();
+    apply_cas_missing_recovery_outcome(&registry, error, inputs_for_recovery)
+}
+
+/// Charges `registry` for `key`'s execution if `batch` selected it for repair.
+///
+/// A key absent from `batch` — a build that did not opt into recovery leaves it empty, and an
+/// action this transaction never armed is never in it — leaves `registry` untouched. The charge
+/// runs regardless of whether the execution that finished succeeded or failed: the budget
+/// tracks how many times an action has actually re-executed under recovery, not how many of those
+/// re-executions fixed the problem.
+fn charge_cas_missing_recovery_repair(
+    registry: &CasMissingRecoveryRegistry,
+    batch: &CasRecoveryBatch,
+    key: &ActionKey,
+) {
+    if batch.contains(key) {
+        registry.record_repair_attempt(key);
+    }
+}
+
+/// Charges the CAS-missing recovery registry for `action` once its execution finishes, reading
+/// the registry and the recovery batch this DICE transaction attached to `ctx` and `executor`.
+///
+/// See [`charge_cas_missing_recovery_repair`] for which actions this charges.
+fn record_cas_missing_recovery_repair(
+    ctx: &DiceComputations<'_>,
+    executor: &BuckActionExecutor,
+    action: &RegisteredAction,
+) {
+    let registry = ctx
+        .per_transaction_data()
+        .get_cas_missing_recovery_registry();
+    charge_cas_missing_recovery_repair(&registry, executor.cas_recovery_batch(), action.key());
 }
 
 // Attempt to run the error handler if one was specified. Returns either the error diagnostics, or
@@ -812,6 +1055,17 @@ impl Key for BuildKey {
     }
 }
 
+/// Invalidates `keys` in `ctx`, so the next computation of each one re-executes instead of
+/// returning DICE's cached result.
+pub fn invalidate_actions_for_recovery(
+    keys: &[ActionKey],
+    ctx: &mut DiceTransactionUpdater,
+) -> buck2_error::Result<()> {
+    let build_keys: Vec<BuildKey> = keys.iter().map(|key| BuildKey(key.dupe())).collect();
+    ctx.changed(build_keys)?;
+    Ok(())
+}
+
 async fn command_execution_report_to_proto(
     report: &CommandExecutionReport,
     allow_omit_details: bool,
@@ -899,4 +1153,419 @@ pub async fn get_target_rule_type_name(
         .underlying_rule_type()
         .name()
         .to_owned())
+}
+
+#[cfg(test)]
+mod cas_missing_recovery_tests {
+    use std::collections::HashSet;
+
+    use buck2_artifact::actions::key::ActionIndex;
+    use buck2_artifact::artifact::artifact_type::Artifact;
+    use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
+    use buck2_artifact::artifact::build_artifact::BuildArtifact;
+    use buck2_artifact::artifact::source_artifact::SourceArtifact;
+    use buck2_common::cas_digest::CasDigest;
+    use buck2_common::cas_digest::CasDigestConfig;
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+    use buck2_core::package::source_path::SourcePath;
+    use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_execute::digest_config::DigestConfig;
+    use buck2_execute::directory::ActionDirectoryBuilder;
+    use buck2_execute::directory::insert_file;
+
+    use super::*;
+
+    fn target() -> ConfiguredTargetLabel {
+        ConfiguredTargetLabel::testing_parse("cell//pkg:foo", ConfigurationData::testing_new())
+    }
+
+    fn build_artifact(name: &str, id: u32) -> (Artifact, ActionKey) {
+        let artifact = BuildArtifact::testing_new(target(), name, ActionIndex::new(id));
+        let key = artifact.key().dupe();
+        (Artifact::from(artifact), key)
+    }
+
+    fn source_artifact(name: &str) -> Artifact {
+        Artifact::from(SourceArtifact::new(SourcePath::testing_new(
+            "cell//pkg",
+            name,
+        )))
+    }
+
+    fn file_digest(byte: u8) -> TrackedFileDigest {
+        TrackedFileDigest::new(
+            CasDigest::new_sha1([byte; 20], 1),
+            CasDigestConfig::testing_default(),
+        )
+    }
+
+    #[test]
+    fn index_artifact_value_digests_indexes_a_file_value() {
+        let (_, action_key) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+
+        let mut index = HashMap::new();
+        index_artifact_value_digests(&value, &action_key, &mut index);
+
+        assert_eq!(index.get(&file_digest(1).to_string()), Some(&action_key));
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn index_artifact_value_digests_maps_every_leaf_in_a_tree_to_the_same_action() {
+        let (_, action_key) = build_artifact("out", 0);
+
+        let mut builder = ActionDirectoryBuilder::empty();
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("out/a".to_owned()),
+            FileMetadata {
+                digest: file_digest(1),
+                is_executable: false,
+            },
+        )
+        .unwrap();
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("out/b".to_owned()),
+            FileMetadata {
+                digest: file_digest(2),
+                is_executable: false,
+            },
+        )
+        .unwrap();
+        let dir = builder
+            .fingerprint(DigestConfig::testing_default().as_directory_serializer())
+            .shared(&*buck2_execute::directory::INTERNER);
+        let value = ArtifactValue::dir(dir);
+
+        let mut index = HashMap::new();
+        index_artifact_value_digests(&value, &action_key, &mut index);
+
+        assert_eq!(index.get(&file_digest(1).to_string()), Some(&action_key));
+        assert_eq!(index.get(&file_digest(2).to_string()), Some(&action_key));
+    }
+
+    #[test]
+    fn index_missing_digest_candidates_skips_source_artifacts() {
+        let (build, build_key) = build_artifact("out", 0);
+        let build_value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+
+        let source = source_artifact("src");
+        let source_value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(2),
+            is_executable: false,
+        });
+
+        let mut ensured_inputs = BuckIndexMap::new();
+        ensured_inputs.insert(
+            ArtifactGroup::Artifact(build.dupe()),
+            ArtifactGroupValues::from_artifact(build, build_value),
+        );
+        ensured_inputs.insert(
+            ArtifactGroup::Artifact(source.dupe()),
+            ArtifactGroupValues::from_artifact(source, source_value),
+        );
+
+        let index = index_missing_digest_candidates(&ensured_inputs);
+
+        assert_eq!(index.get(&file_digest(1).to_string()), Some(&build_key));
+        assert_eq!(index.get(&file_digest(2).to_string()), None);
+        assert_eq!(index.len(), 1);
+    }
+
+    fn missing_entry(path: &str, digest: TrackedFileDigest) -> (ProjectRelativePathBuf, String) {
+        (
+            ProjectRelativePathBuf::unchecked_new(path.to_owned()),
+            digest.to_string(),
+        )
+    }
+
+    fn ensured_inputs_with(
+        artifact: Artifact,
+        value: ArtifactValue,
+    ) -> BuckIndexMap<ArtifactGroup, ArtifactGroupValues> {
+        let mut ensured_inputs = BuckIndexMap::new();
+        ensured_inputs.insert(
+            ArtifactGroup::Artifact(artifact.dupe()),
+            ArtifactGroupValues::from_artifact(artifact, value),
+        );
+        ensured_inputs
+    }
+
+    fn command_execution_error(context: Option<MissingCasDigests>) -> ExecuteError {
+        let mut error = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::ReCasArtifactMissingRecoverable,
+            "artifact missing"
+        );
+        if let Some(context) = context {
+            error = error.context(context);
+        }
+        ExecuteError::CommandExecutionError {
+            action_outputs: ActionOutputs::new(BuckIndexMap::new()),
+            error: Some(error),
+        }
+    }
+
+    #[test]
+    fn resolve_outcome_arms_the_action_that_produced_a_missing_digest() {
+        let (build, build_key) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let missing = MissingCasDigests {
+            missing: vec![missing_entry("out", file_digest(1))],
+        };
+
+        let outcome = resolve_cas_missing_recovery_outcome(&missing, &ensured_inputs);
+
+        assert_eq!(outcome.producing_actions, vec![build_key]);
+        assert_eq!(outcome.unattributed, Vec::new());
+        assert_eq!(outcome.guidance, CAS_MISSING_RECOVERY_QUEUED);
+    }
+
+    #[test]
+    fn resolve_outcome_leaves_a_digest_with_no_producing_action_unattributed() {
+        // The digest here belongs to no input this action declared, e.g. a source file. This
+        // must not be treated as an error: the caller falls through to the fatal guidance.
+        let (build, _) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let missing = MissingCasDigests {
+            missing: vec![missing_entry("src", file_digest(2))],
+        };
+
+        let outcome = resolve_cas_missing_recovery_outcome(&missing, &ensured_inputs);
+
+        assert_eq!(outcome.producing_actions, Vec::new());
+        assert_eq!(
+            outcome.unattributed,
+            vec![missing_entry("src", file_digest(2))]
+        );
+        assert_eq!(outcome.guidance, CAS_MISSING_RECOVERY_UNATTRIBUTED);
+    }
+
+    #[test]
+    fn resolve_outcome_is_queued_when_only_some_digests_attribute() {
+        // A partial match still lets recovery repair what it can identify: the guidance reflects
+        // that at least one producing action was found, even though another digest in the same
+        // failure resolved to nothing.
+        let (build, build_key) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let missing = MissingCasDigests {
+            missing: vec![
+                missing_entry("out", file_digest(1)),
+                missing_entry("src", file_digest(2)),
+            ],
+        };
+
+        let outcome = resolve_cas_missing_recovery_outcome(&missing, &ensured_inputs);
+
+        assert_eq!(outcome.producing_actions, vec![build_key]);
+        assert_eq!(
+            outcome.unattributed,
+            vec![missing_entry("src", file_digest(2))]
+        );
+        assert_eq!(outcome.guidance, CAS_MISSING_RECOVERY_QUEUED);
+    }
+
+    fn message_of(error: &ExecuteError) -> String {
+        let ExecuteError::CommandExecutionError {
+            error: Some(inner), ..
+        } = error
+        else {
+            panic!("expected a CommandExecutionError");
+        };
+        format!("{inner}")
+    }
+
+    #[test]
+    fn apply_outcome_passes_through_errors_without_typed_context() {
+        let registry = CasMissingRecoveryRegistry::new();
+        let error = command_execution_error(None);
+
+        let result =
+            apply_cas_missing_recovery_outcome(&registry, error, Some(&BuckIndexMap::new()));
+
+        assert_eq!(message_of(&result), "artifact missing");
+    }
+
+    #[test]
+    fn apply_outcome_passes_through_non_command_execution_errors() {
+        let registry = CasMissingRecoveryRegistry::new();
+        let error = ExecuteError::MissingOutputs { declared: vec![] };
+
+        let result =
+            apply_cas_missing_recovery_outcome(&registry, error, Some(&BuckIndexMap::new()));
+
+        assert!(matches!(result, ExecuteError::MissingOutputs { .. }));
+    }
+
+    #[test]
+    fn apply_outcome_arms_the_registry_and_replaces_the_guidance_when_attributed() {
+        let registry = CasMissingRecoveryRegistry::new();
+        let (build, build_key) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let error = command_execution_error(Some(MissingCasDigests {
+            missing: vec![missing_entry("out", file_digest(1))],
+        }));
+
+        let result = apply_cas_missing_recovery_outcome(&registry, error, Some(&ensured_inputs));
+
+        assert_eq!(registry.keys_eligible_for_recovery(1), vec![build_key]);
+        assert!(message_of(&result).contains(CAS_MISSING_RECOVERY_QUEUED));
+    }
+
+    #[test]
+    fn apply_outcome_leaves_the_registry_untouched_when_unattributed() {
+        let registry = CasMissingRecoveryRegistry::new();
+        let (build, _) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let error = command_execution_error(Some(MissingCasDigests {
+            missing: vec![missing_entry("src", file_digest(2))],
+        }));
+
+        let result = apply_cas_missing_recovery_outcome(&registry, error, Some(&ensured_inputs));
+
+        assert_eq!(
+            registry.keys_eligible_for_recovery(1),
+            Vec::<ActionKey>::new()
+        );
+        assert!(message_of(&result).contains(CAS_MISSING_RECOVERY_UNATTRIBUTED));
+    }
+
+    #[test]
+    fn apply_outcome_passes_through_the_failure_when_recovery_is_disabled() {
+        // The failure here is the one that arms a producing action and rewrites the guidance for a
+        // build that opted in. Recovery is opt-in, so a daemon that did not opt in must build
+        // exactly as it does with the feature absent: the user sees the message the executor
+        // produced, and the next transaction re-executes nothing.
+        let registry = CasMissingRecoveryRegistry::new();
+        let error = command_execution_error(Some(MissingCasDigests {
+            missing: vec![missing_entry("out", file_digest(1))],
+        }));
+
+        let result = apply_cas_missing_recovery_outcome(&registry, error, None);
+
+        assert_eq!(message_of(&result), "artifact missing");
+        assert_eq!(
+            registry.keys_eligible_for_recovery(1),
+            Vec::<ActionKey>::new()
+        );
+    }
+
+    #[test]
+    fn charge_repair_ignores_an_armed_key_the_batch_did_not_select() {
+        // The registry can hold more than one armed key at once — an action arms only when it is
+        // in the batch this transaction was handed, never merely because it is armed somewhere in
+        // the daemon-lifetime registry.
+        let registry = CasMissingRecoveryRegistry::new();
+        let (_, in_batch) = build_artifact("selected", 0);
+        let (_, armed_elsewhere) = build_artifact("armed_elsewhere", 1);
+        registry.record_missing(in_batch.dupe());
+        registry.record_missing(armed_elsewhere.dupe());
+        let batch = CasRecoveryBatch::new(HashSet::from([in_batch.dupe()]));
+
+        charge_cas_missing_recovery_repair(&registry, &batch, &armed_elsewhere);
+
+        let still_eligible: HashSet<ActionKey> =
+            registry.keys_eligible_for_recovery(1).into_iter().collect();
+        assert_eq!(
+            still_eligible,
+            HashSet::from([in_batch.dupe(), armed_elsewhere.dupe()])
+        );
+    }
+
+    #[test]
+    fn charge_repair_charges_a_key_the_batch_selected() {
+        let registry = CasMissingRecoveryRegistry::new();
+        let (_, in_batch) = build_artifact("selected", 0);
+        registry.record_missing(in_batch.dupe());
+        let batch = CasRecoveryBatch::new(HashSet::from([in_batch.dupe()]));
+
+        charge_cas_missing_recovery_repair(&registry, &batch, &in_batch);
+
+        assert_eq!(
+            registry.keys_eligible_for_recovery(1),
+            Vec::<ActionKey>::new()
+        );
+    }
+
+    #[test]
+    fn charge_repair_against_an_empty_batch_charges_nothing() {
+        // A build with recovery disabled attaches an empty batch to every action it executes, as
+        // does a transaction the registry armed nothing for.
+        let registry = CasMissingRecoveryRegistry::new();
+        let (_, key) = build_artifact("out", 0);
+        registry.record_missing(key.dupe());
+        let batch = CasRecoveryBatch::empty();
+
+        charge_cas_missing_recovery_repair(&registry, &batch, &key);
+
+        assert_eq!(registry.keys_eligible_for_recovery(1), vec![key]);
+    }
+
+    #[test]
+    fn a_build_with_recovery_enabled_retains_the_inputs_attribution_resolves_digests_against() {
+        let (build, build_key) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let knobs = RunActionKnobs {
+            cas_missing_recovery_enabled: true,
+            ..Default::default()
+        };
+
+        let retained = inputs_for_cas_missing_recovery(&knobs, &ensured_inputs)
+            .expect("a build that opted into recovery retains its inputs");
+
+        assert_eq!(
+            index_missing_digest_candidates(&retained).get(&file_digest(1).to_string()),
+            Some(&build_key)
+        );
+    }
+
+    #[test]
+    fn a_build_with_recovery_disabled_retains_no_inputs() {
+        let (build, _) = build_artifact("out", 0);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: file_digest(1),
+            is_executable: false,
+        });
+        let ensured_inputs = ensured_inputs_with(build, value);
+        let knobs = RunActionKnobs {
+            cas_missing_recovery_enabled: false,
+            ..Default::default()
+        };
+
+        assert!(inputs_for_cas_missing_recovery(&knobs, &ensured_inputs).is_none());
+    }
 }

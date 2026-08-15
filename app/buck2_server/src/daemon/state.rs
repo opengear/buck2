@@ -15,6 +15,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use allocative::Allocative;
+use buck2_build_api::actions::cas_missing_recovery::CasMissingRecoveryRegistry;
 use buck2_build_api::interpreter::rule_defs::context::init_action_has_content_based_path_default;
 use buck2_build_api::interpreter::rule_defs::context::init_declare_output_has_content_based_path_default;
 use buck2_build_api::spawner::BuckSpawner;
@@ -178,6 +179,19 @@ pub struct DaemonStateData {
     /// Whether to enable the restarter. This controls whether the client will attempt to restart
     /// the daemon when we hit an error.
     pub enable_restarter: bool,
+
+    /// When enabled, an action execution failure caused by a missing RE CAS digest identifies
+    /// the producing action and marks it for re-execution. When disabled, the failure is fatal
+    /// and fails the build.
+    pub cas_missing_recovery_enabled: bool,
+
+    /// The number of times CAS-missing recovery re-executes a single action before leaving its
+    /// failure fatal.
+    pub cas_missing_recovery_max_action_attempts: u32,
+
+    /// Actions whose declared CAS output was reported missing during execution, tracked for the
+    /// daemon's lifetime so the next DICE transaction can invalidate them for recovery.
+    pub cas_missing_recovery_registry: Arc<CasMissingRecoveryRegistry>,
 
     /// Http client used for materializer and RunAction implementations.
     pub http_client: HttpClient,
@@ -672,6 +686,21 @@ impl DaemonState {
                 .unwrap_or_else(RolloutPercentage::never)
                 .roll();
 
+            let cas_missing_recovery_enabled = root_config
+                .parse::<RolloutPercentage>(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "cas_missing_recovery",
+                })?
+                .unwrap_or_else(RolloutPercentage::never)
+                .roll();
+
+            let cas_missing_recovery_max_action_attempts = root_config
+                .parse::<u32>(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "cas_missing_recovery_max_action_attempts",
+                })?
+                .unwrap_or(2);
+
             let paranoid = if init_ctx.daemon_startup_config.paranoid {
                 Some(ParanoidDownloader::new(
                     fs.clone(),
@@ -756,6 +785,9 @@ impl DaemonState {
                 create_unhashed_outputs_lock,
                 materializer_state_identity,
                 enable_restarter,
+                cas_missing_recovery_enabled,
+                cas_missing_recovery_max_action_attempts,
+                cas_missing_recovery_registry: Arc::new(CasMissingRecoveryRegistry::new()),
                 http_client,
                 paranoid,
                 spawner: Arc::new(BuckSpawner::new(daemon_state_data_rt)),

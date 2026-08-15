@@ -29,6 +29,7 @@ use buck2_execute::digest_config::HasDigestConfig;
 use buck2_execute::directory::ActionDirectoryBuilder;
 use buck2_execute::execute::blobs::ActionBlobs;
 use buck2_execute::materialize::materializer::HasMaterializer;
+use buck2_execute::re::uploader::CasMissingRecovery;
 use buck2_hash::BuckDashSet;
 use dice::DiceComputations;
 use dice::UserComputationData;
@@ -223,6 +224,11 @@ async fn ensure_uploaded(
             ctx.per_transaction_data()
                 .get_run_action_knobs()
                 .deduplicate_get_digests_ttl_calls,
+            // CAS-missing recovery attributes a repair to the action whose input digest went
+            // missing during that action's own execution attempt. This uploads top-level
+            // requested artifacts, which have no execution attempt of their own, so recovery
+            // attributes nothing to it.
+            CasMissingRecovery::Disabled,
         )
         .await?;
 

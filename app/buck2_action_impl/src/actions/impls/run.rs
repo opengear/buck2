@@ -1111,18 +1111,29 @@ impl RunAction {
             prepared_run_action.worker.as_ref().map(|w| &w.input_paths),
         )?;
 
+        // CAS-missing recovery invalidated this action for repair: every cache lookup below,
+        // local and remote, must be bypassed so the re-run actually executes instead of handing
+        // back the cached result that references the digest reported missing.
+        let skip_cache_lookup = ctx.target().should_skip_cache_lookup();
+
         // First, check in the local dep file cache if an identical action can be found there.
         // Do this before checking the action cache as we can avoid a potentially large download.
         // Once the action cache lookup misses, we will do the full dep file cache look up.
         let (outputs, should_fully_check_dep_file_cache) = dep_file_bundle
-            .check_local_dep_file_cache_for_identical_action(ctx, self.outputs.as_slice())
+            .check_local_dep_file_cache_for_identical_action(
+                ctx,
+                self.outputs.as_slice(),
+                skip_cache_lookup,
+            )
             .await?;
         if let Some((outputs, metadata)) = outputs {
             return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
         }
 
-        let req =
-            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
+        let req = self
+            .command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?
+            .with_skip_cache_lookup(skip_cache_lookup)
+            .with_cas_missing_recovery_enabled(ctx.run_action_knobs().cas_missing_recovery_enabled);
 
         // Prepare the action, check the action cache, fully check the local dep file cache if needed, then execute the command
         let prepared_action = ctx.prepare_action(&req, true)?;

@@ -17,6 +17,10 @@ use std::time::Instant;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_build_api::actions::calculation::invalidate_actions_for_recovery;
+use buck2_build_api::actions::cas_missing_recovery::CasRecoveryBatch;
+use buck2_build_api::actions::cas_missing_recovery::SetCasMissingRecoveryRegistry;
+use buck2_build_api::actions::cas_missing_recovery::SetCasRecoveryBatch;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
@@ -129,6 +133,8 @@ use dupe::Dupe;
 use gazebo::prelude::SliceExt;
 use host_sharing::HostSharingBroker;
 use host_sharing::HostSharingStrategy;
+use itertools::Itertools;
+use tracing::info;
 use tracing::warn;
 
 use crate::active_commands::ActiveCommandDropGuard;
@@ -421,6 +427,8 @@ impl<'a> ServerCommandContext<'a> {
             default_allow_cache_upload: false,
             action_paths_interner: None,
             deduplicate_get_digests_ttl_calls: false,
+            re_outputs_required: false,
+            cas_missing_recovery_enabled: false,
         };
 
         let concurrency = self
@@ -455,6 +463,7 @@ impl<'a> ServerCommandContext<'a> {
             upload_all_actions,
             skip_cache_read,
             skip_cache_write,
+            cas_missing_recovery_enabled: self.base_context.daemon.cas_missing_recovery_enabled,
             keep_going: self
                 .build_options
                 .as_ref()
@@ -600,6 +609,7 @@ struct DiceCommandUpdater<'s, 'a: 's> {
     run_action_knobs: RunActionKnobs,
     skip_cache_read: bool,
     skip_cache_write: bool,
+    cas_missing_recovery_enabled: bool,
     keep_going: bool,
     materialize_failed_inputs: bool,
     materialize_failed_outputs: bool,
@@ -701,7 +711,7 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
         )?;
 
         early_timings.start_span(FILE_WATCHER_WAIT.to_owned());
-        let (ctx, mergebase) = self
+        let (mut ctx, mergebase) = self
             .cmd_ctx
             .base_context
             .daemon
@@ -710,14 +720,73 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             .await?;
         early_timings.end_known_span();
 
+        let cas_recovery_batch = self.stage_cas_missing_recovery_batch(&mut ctx);
+
         let mut user_data = self.make_user_computation_data(&cells_and_configs.root_config)?;
         user_data.set_mergebase(mergebase);
+        user_data.set_cas_missing_recovery_registry(
+            self.cmd_ctx
+                .base_context
+                .daemon
+                .cas_missing_recovery_registry
+                .dupe(),
+        );
+        user_data.set_cas_recovery_batch(cas_recovery_batch);
 
         Ok((ctx, user_data))
     }
 }
 
 impl DiceCommandUpdater<'_, '_> {
+    /// Selects the actions the CAS-missing recovery registry has armed for this transaction,
+    /// invalidates them so they recompute instead of returning DICE's cached failure, and returns
+    /// the batch so the executor layer can route those actions around cached results that would
+    /// hand back the digest that was reported missing. The registry itself is untouched here: an
+    /// action is charged against its attempt budget only once the executor layer confirms it
+    /// actually re-executed.
+    ///
+    /// The registry only gains entries through `CasMissingRecoveryRegistry::record_missing`,
+    /// which the build layer calls only when recovery is enabled, so a disabled build keeps the
+    /// registry empty and this returns an empty batch after the config check alone. Invalidation
+    /// failure also returns an empty batch, so the batch handed to the executor layer never
+    /// claims an action was invalidated when it was not.
+    fn stage_cas_missing_recovery_batch(
+        &self,
+        ctx: &mut DiceTransactionUpdater,
+    ) -> CasRecoveryBatch {
+        if !self.cas_missing_recovery_enabled {
+            return CasRecoveryBatch::empty();
+        }
+
+        let daemon = &self.cmd_ctx.base_context.daemon;
+        let keys = daemon
+            .cas_missing_recovery_registry
+            .keys_eligible_for_recovery(daemon.cas_missing_recovery_max_action_attempts);
+        if keys.is_empty() {
+            return CasRecoveryBatch::empty();
+        }
+
+        let actions = keys.iter().map(|key| key.to_string()).join(", ");
+
+        if let Err(e) = invalidate_actions_for_recovery(&keys, ctx) {
+            warn!(
+                error = %e,
+                action_count = keys.len(),
+                actions = %actions,
+                "invalidating actions for CAS-missing recovery"
+            );
+            return CasRecoveryBatch::empty();
+        }
+
+        info!(
+            action_count = keys.len(),
+            actions = %actions,
+            "invalidated actions for CAS-missing recovery"
+        );
+
+        CasRecoveryBatch::new(keys.into_iter().collect())
+    }
+
     fn make_user_computation_data(
         &self,
         root_config: &LegacyBuckConfig,
@@ -860,6 +929,15 @@ impl DiceCommandUpdater<'_, '_> {
             })?
             .unwrap_or(false);
 
+        run_action_knobs.re_outputs_required |= root_config
+            .parse::<bool>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "re_outputs_required",
+            })?
+            .unwrap_or(false);
+
+        run_action_knobs.cas_missing_recovery_enabled = self.cas_missing_recovery_enabled;
+
         let output_trees_download_semaphore_size = root_config.parse::<u32>(BuckconfigKeyRef {
             section: "buck2",
             property: "output_trees_download_semaphore_size",
@@ -951,6 +1029,7 @@ impl DiceCommandUpdater<'_, '_> {
             run_action_knobs.deduplicate_get_digests_ttl_calls,
             output_trees_download_config.dupe(),
             self.cmd_ctx.base_context.daemon.daemon_id.dupe(),
+            self.cas_missing_recovery_enabled,
         )));
         data.set_blocking_executor(self.cmd_ctx.base_context.daemon.blocking_executor.dupe());
         data.set_http_client(self.cmd_ctx.base_context.daemon.http_client.dupe());

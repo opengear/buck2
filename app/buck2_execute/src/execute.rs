@@ -21,6 +21,7 @@ pub mod environment_inheritance;
 pub mod inputs_directory;
 pub mod kind;
 pub mod manager;
+pub mod missing_cas_digests;
 pub mod output;
 pub mod paths_with_digest;
 pub mod prepared;
