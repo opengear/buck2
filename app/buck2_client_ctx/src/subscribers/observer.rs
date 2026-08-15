@@ -25,4 +25,22 @@ pub trait ErrorObserver {
     fn restarter_is_enabled(&self) -> bool {
         false
     }
+
+    /// Whether the daemon reported this command's failure as recoverable by retrying the same
+    /// command against the same daemon.
+    fn recoverable_by_command_retry(&self) -> bool {
+        false
+    }
+
+    /// Whether the daemon has opted into automatically retrying a command whose failure it
+    /// reports as recoverable by retry.
+    fn command_retry_on_recoverable_failure_is_enabled(&self) -> bool {
+        false
+    }
+
+    /// The number of automatic same-daemon retries the client may perform for one invocation
+    /// before treating a recoverable failure as final.
+    fn max_command_retries_on_recoverable_failure(&self) -> u32 {
+        0
+    }
 }

@@ -8,9 +8,11 @@
  * above-listed licenses.
  */
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -642,6 +644,40 @@ fn collect_entry_digests(
     missing
 }
 
+fn convert_tombstoned_digests_env(val: &str) -> buck2_error::Result<HashSet<FileDigest>> {
+    val.split(' ')
+        .map(|digest| {
+            let digest = TDigest::from_str(digest)
+                .map_err(|e| from_any_with_tag(e, ErrorTag::InvalidDigest))
+                .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
+            // This code is only used by E2E tests, so while it's not *a test*, testing_default
+            // is an OK choice here.
+            let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
+            buck2_error::Ok(digest)
+        })
+        .collect()
+}
+
+/// The digests `BUCK2_TEST_TOMBSTONED_DIGESTS` names, minus whichever of them
+/// [`clear_tombstoned_test_digests`] has since cleared.
+fn configured_tombstoned_digests() -> buck2_error::Result<HashSet<FileDigest>> {
+    Ok(buck2_env!(
+        "BUCK2_TEST_TOMBSTONED_DIGESTS",
+        type=HashSet<FileDigest>,
+        converter=convert_tombstoned_digests_env,
+        applicability=testing,
+    )?
+    .cloned()
+    .unwrap_or_default())
+}
+
+/// Digests [`clear_tombstoned_test_digests`] has removed from fault injection, so
+/// [`maybe_tombstone_digest`] treats them as present even though `BUCK2_TEST_TOMBSTONED_DIGESTS`
+/// still names them. The environment variable is fixed for the daemon's lifetime; this is the
+/// only way a running daemon stops treating a digest as missing from the RE CAS.
+static CLEARED_TOMBSTONED_DIGESTS: LazyLock<Mutex<HashSet<FileDigest>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// This is used for testing to ingest digests (via BUCK2_TEST_TOMBSTONED_DIGESTS).
 fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDigest> {
     // This has to be of size 1 since size 0 will result in the RE client just producing an empty
@@ -649,33 +685,54 @@ fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDiges
     static TOMBSTONE_DIGEST: LazyLock<FileDigest> =
         LazyLock::new(|| FileDigest::new_sha1([0; 20], 1));
 
-    fn convert_digests(val: &str) -> buck2_error::Result<StdBuckHashSet<FileDigest>> {
-        val.split(' ')
-            .map(|digest| {
-                let digest = TDigest::from_str(digest)
-                    .map_err(|e| from_any_with_tag(e, ErrorTag::InvalidDigest))
-                    .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
-                // This code is only used by E2E tests, so while it's not *a test*, testing_default
-                // is an OK choice here.
-                let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
-                buck2_error::Ok(digest)
-            })
-            .collect()
-    }
-
-    let tombstoned_digests = buck2_env!(
-        "BUCK2_TEST_TOMBSTONED_DIGESTS",
-        type=StdBuckHashSet<FileDigest>,
-        converter=convert_digests,
-        applicability=testing,
-    )?;
-    if let Some(digests) = tombstoned_digests {
-        if digests.contains(digest) {
-            return Ok(&*TOMBSTONE_DIGEST);
-        }
+    let tombstoned_digests = configured_tombstoned_digests()?;
+    let cleared = CLEARED_TOMBSTONED_DIGESTS
+        .lock()
+        .expect("tombstoned digest lock poisoned");
+    if tombstoned_digests.contains(digest) && !cleared.contains(digest) {
+        return Ok(&*TOMBSTONE_DIGEST);
     }
 
     Ok(digest)
+}
+
+/// Clears every digest `BUCK2_TEST_TOMBSTONED_DIGESTS` currently marks as missing from the RE
+/// CAS, so the next materialization request for any of them reaches the real RE CAS instead of
+/// the sentinel substitution [`maybe_tombstone_digest`] otherwise returns for it.
+///
+/// This lets an e2e test simulate a CAS-missing repair reaching a digest that has become
+/// available again: re-executing the producing action reproduces the identical digest, which
+/// `BUCK2_TEST_TOMBSTONED_DIGESTS` would otherwise keep tombstoning forever, since it is read
+/// once and fixed for the daemon's lifetime.
+pub(crate) fn clear_tombstoned_test_digests() -> buck2_error::Result<()> {
+    let tombstoned_digests = configured_tombstoned_digests()?;
+    CLEARED_TOMBSTONED_DIGESTS
+        .lock()
+        .expect("tombstoned digest lock poisoned")
+        .extend(tombstoned_digests);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tombstoned_digest_tests {
+    use super::*;
+
+    fn digest(byte: u8) -> FileDigest {
+        FileDigest::new_sha1([byte; 20], 1)
+    }
+
+    #[test]
+    fn clearing_an_untombstoned_digest_is_a_no_op() {
+        // BUCK2_TEST_TOMBSTONED_DIGESTS is unset in this process, so nothing is tombstoned to
+        // begin with; clearing must not panic or tombstone anything on its own.
+        clear_tombstoned_test_digests()
+            .expect("clearing should succeed with no configured digests");
+        let untombstoned = digest(1);
+        assert_eq!(
+            maybe_tombstone_digest(&untombstoned).expect("lookup should succeed"),
+            &untombstoned
+        );
+    }
 }
 
 /// Spawn a task to refresh TTLs.

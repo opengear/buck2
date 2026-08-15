@@ -9,10 +9,13 @@ Commands:
   list-subscriptions
   fsck
   refresh
-  get-refresh-log     Get the log for TTL refreshes
+  get-refresh-log                Get the log for TTL refreshes
   test-iter
   flush-access-times
-  help                Print this message or the help of the given subcommand(s)
+  clear-tombstoned-test-digests  Clear digests injected by BUCK2_TEST_TOMBSTONED_DIGESTS as missing
+                                 from the RE CAS, so a later materialization request for any of them
+                                 reaches the real RE CAS
+  help                           Print this message or the help of the given subcommand(s)
 
 Options:
   -m, --modifier <VALUE>

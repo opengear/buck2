@@ -186,7 +186,10 @@ pub struct InvocationRecorder {
     load_count: u64,
     daemon_in_memory_state_is_corrupted: bool,
     daemon_materializer_state_is_corrupted: bool,
+    recoverable_by_command_retry: bool,
     enable_restarter: bool,
+    command_retry_on_recoverable_failure_is_enabled: bool,
+    max_command_retries_on_recoverable_failure: u32,
     restarted_trace_id: Option<TraceId>,
     preemptible: Option<PreemptibleWhen>,
     has_command_result: bool,
@@ -404,7 +407,10 @@ impl InvocationRecorder {
             load_count: 0,
             daemon_in_memory_state_is_corrupted: false,
             daemon_materializer_state_is_corrupted: false,
+            recoverable_by_command_retry: false,
             enable_restarter: false,
+            command_retry_on_recoverable_failure_is_enabled: false,
+            max_command_retries_on_recoverable_failure: 0,
             restarted_trace_id,
             preemptible: None,
             has_command_result: false,
@@ -2215,6 +2221,10 @@ impl InvocationRecorder {
             if err.daemon_materializer_state_is_corrupted {
                 self.daemon_materializer_state_is_corrupted = true;
             }
+
+            if err.recoverable_by_command_retry {
+                self.recoverable_by_command_retry = true;
+            }
         }
 
         Ok(())
@@ -2425,6 +2435,10 @@ impl InvocationRecorder {
                     }
                     buck2_data::instant_event::Data::RestartConfiguration(conf) => {
                         self.enable_restarter = conf.enable_restarter;
+                        self.command_retry_on_recoverable_failure_is_enabled =
+                            conf.enable_command_retry_on_recoverable_failure;
+                        self.max_command_retries_on_recoverable_failure =
+                            conf.max_command_retries_on_recoverable_failure;
                         Ok(())
                     }
                     buck2_data::instant_event::Data::ConcurrentCommands(concurrent_commands) => {
@@ -2664,6 +2678,18 @@ impl ErrorObserver for InvocationRecorder {
 
     fn restarter_is_enabled(&self) -> bool {
         self.enable_restarter
+    }
+
+    fn recoverable_by_command_retry(&self) -> bool {
+        self.recoverable_by_command_retry
+    }
+
+    fn command_retry_on_recoverable_failure_is_enabled(&self) -> bool {
+        self.command_retry_on_recoverable_failure_is_enabled
+    }
+
+    fn max_command_retries_on_recoverable_failure(&self) -> u32 {
+        self.max_command_retries_on_recoverable_failure
     }
 }
 

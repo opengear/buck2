@@ -235,6 +235,9 @@ pub struct StructuredErrorOptions {
     pub daemon_in_memory_state_is_corrupted: bool,
     pub daemon_materializer_state_is_corrupted: bool,
     pub action_cache_is_corrupted: bool,
+    /// The daemon addressed the cause of this failure, so retrying the same command against the
+    /// same daemon is expected to succeed.
+    pub recoverable_by_command_retry: bool,
     // By default, we only get a handful of traces per error category in Logview.
     // This key, if specified, enables logging one trace per unique key using
     // the "trace cut" feature of Logview. Note that the dimensionality of this
@@ -253,6 +256,7 @@ impl Default for StructuredErrorOptions {
             daemon_in_memory_state_is_corrupted: false,
             daemon_materializer_state_is_corrupted: false,
             action_cache_is_corrupted: false,
+            recoverable_by_command_retry: false,
             low_cardinality_key_for_additional_logview_samples: None,
         }
     }

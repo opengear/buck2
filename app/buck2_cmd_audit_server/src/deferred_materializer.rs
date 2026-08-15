@@ -111,6 +111,13 @@ impl ServerAuditSubcommand for DeferredMaterializerCommand {
 
                 write!(stdout, "{text}")?;
             }
+            DeferredMaterializerSubcommand::ClearTombstonedTestDigests => {
+                deferred_materializer
+                    .clear_tombstoned_test_digests()
+                    .buck_error_context(
+                        "Clearing digests tombstoned by BUCK2_TEST_TOMBSTONED_DIGESTS",
+                    )?;
+            }
         }
 
         buck2_error::Ok(())

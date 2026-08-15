@@ -845,6 +845,11 @@ pub trait DeferredMaterializerExtensions: Send + Sync {
     async fn create_subscription(
         &self,
     ) -> buck2_error::Result<Box<dyn DeferredMaterializerSubscription>>;
+
+    /// Clears every digest test fault-injection (`BUCK2_TEST_TOMBSTONED_DIGESTS`) currently
+    /// reports missing from the RE CAS, so a later materialization request for any of them
+    /// reaches the real RE CAS instead of a manufactured not-found error.
+    fn clear_tombstoned_test_digests(&self) -> buck2_error::Result<()>;
 }
 
 #[derive(Debug, Clone)]
