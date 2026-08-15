@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -228,7 +230,9 @@ impl DefaultIoHandler {
                     while let Some((entry_path, entry)) = walk.next() {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) = entry {
                             let name = path.join(entry_path.get());
-                            let digest = maybe_tombstone_digest(f.digest.data())?.to_re();
+                            let digest =
+                                maybe_tombstone_digest(f.digest.data(), self.digest_config)?
+                                    .to_re();
 
                             tracing::trace!(name = %name, digest = %digest, "push download");
                             let name = self
@@ -644,15 +648,19 @@ fn collect_entry_digests(
     missing
 }
 
-fn convert_tombstoned_digests_env(val: &str) -> buck2_error::Result<HashSet<FileDigest>> {
+/// Parses `BUCK2_TEST_TOMBSTONED_DIGESTS` under `digest_config`, so a digest names the same
+/// blob the daemon addresses. A backend the daemon talks to in SHA256, which every REAPI server
+/// requires, hashes a file to a 64-character digest that a SHA1-only configuration rejects.
+fn parse_tombstoned_digests(
+    val: &str,
+    digest_config: DigestConfig,
+) -> buck2_error::Result<HashSet<FileDigest>> {
     val.split(' ')
         .map(|digest| {
             let digest = TDigest::from_str(digest)
                 .map_err(|e| from_any_with_tag(e, ErrorTag::InvalidDigest))
                 .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
-            // This code is only used by E2E tests, so while it's not *a test*, testing_default
-            // is an OK choice here.
-            let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
+            let digest = FileDigest::from_re(&digest, digest_config)?;
             buck2_error::Ok(digest)
         })
         .collect()
@@ -660,36 +668,48 @@ fn convert_tombstoned_digests_env(val: &str) -> buck2_error::Result<HashSet<File
 
 /// The digests `BUCK2_TEST_TOMBSTONED_DIGESTS` names, minus whichever of them
 /// [`clear_tombstoned_test_digests`] has since cleared.
-fn configured_tombstoned_digests() -> buck2_error::Result<HashSet<FileDigest>> {
-    Ok(buck2_env!(
-        "BUCK2_TEST_TOMBSTONED_DIGESTS",
-        type=HashSet<FileDigest>,
-        converter=convert_tombstoned_digests_env,
-        applicability=testing,
-    )?
-    .cloned()
-    .unwrap_or_default())
+///
+/// The environment variable is fixed for the daemon's lifetime and `digest_config` is decided at
+/// daemon startup, so the parse result is computed once and reused.
+fn configured_tombstoned_digests(
+    digest_config: DigestConfig,
+) -> buck2_error::Result<&'static HashSet<FileDigest>> {
+    static TOMBSTONED_DIGESTS: OnceLock<HashSet<FileDigest>> = OnceLock::new();
+
+    if let Some(digests) = TOMBSTONED_DIGESTS.get() {
+        return Ok(digests);
+    }
+
+    let configured = buck2_env!("BUCK2_TEST_TOMBSTONED_DIGESTS", applicability = testing)?;
+    let digests = match configured {
+        Some(val) => parse_tombstoned_digests(val, digest_config)?,
+        None => HashSet::new(),
+    };
+
+    Ok(TOMBSTONED_DIGESTS.get_or_init(|| digests))
 }
 
-/// Digests [`clear_tombstoned_test_digests`] has removed from fault injection, so
-/// [`maybe_tombstone_digest`] treats them as present even though `BUCK2_TEST_TOMBSTONED_DIGESTS`
-/// still names them. The environment variable is fixed for the daemon's lifetime; this is the
-/// only way a running daemon stops treating a digest as missing from the RE CAS.
-static CLEARED_TOMBSTONED_DIGESTS: LazyLock<Mutex<HashSet<FileDigest>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Set once [`clear_tombstoned_test_digests`] runs, after which [`maybe_tombstone_digest`]
+/// treats every digest as present even though `BUCK2_TEST_TOMBSTONED_DIGESTS` still names it.
+/// The environment variable is fixed for the daemon's lifetime; this is the only way a running
+/// daemon stops treating a digest as missing from the RE CAS.
+static TOMBSTONES_CLEARED: AtomicBool = AtomicBool::new(false);
 
 /// This is used for testing to ingest digests (via BUCK2_TEST_TOMBSTONED_DIGESTS).
-fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDigest> {
+fn maybe_tombstone_digest(
+    digest: &FileDigest,
+    digest_config: DigestConfig,
+) -> buck2_error::Result<&FileDigest> {
     // This has to be of size 1 since size 0 will result in the RE client just producing an empty
     // instead of a not-found error.
     static TOMBSTONE_DIGEST: LazyLock<FileDigest> =
         LazyLock::new(|| FileDigest::new_sha1([0; 20], 1));
 
-    let tombstoned_digests = configured_tombstoned_digests()?;
-    let cleared = CLEARED_TOMBSTONED_DIGESTS
-        .lock()
-        .expect("tombstoned digest lock poisoned");
-    if tombstoned_digests.contains(digest) && !cleared.contains(digest) {
+    if TOMBSTONES_CLEARED.load(Ordering::Relaxed) {
+        return Ok(digest);
+    }
+
+    if configured_tombstoned_digests(digest_config)?.contains(digest) {
         return Ok(&*TOMBSTONE_DIGEST);
     }
 
@@ -705,11 +725,7 @@ fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDiges
 /// `BUCK2_TEST_TOMBSTONED_DIGESTS` would otherwise keep tombstoning forever, since it is read
 /// once and fixed for the daemon's lifetime.
 pub(crate) fn clear_tombstoned_test_digests() -> buck2_error::Result<()> {
-    let tombstoned_digests = configured_tombstoned_digests()?;
-    CLEARED_TOMBSTONED_DIGESTS
-        .lock()
-        .expect("tombstoned digest lock poisoned")
-        .extend(tombstoned_digests);
+    TOMBSTONES_CLEARED.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -729,7 +745,8 @@ mod tombstoned_digest_tests {
             .expect("clearing should succeed with no configured digests");
         let untombstoned = digest(1);
         assert_eq!(
-            maybe_tombstone_digest(&untombstoned).expect("lookup should succeed"),
+            maybe_tombstone_digest(&untombstoned, DigestConfig::testing_default())
+                .expect("lookup should succeed"),
             &untombstoned
         );
     }

@@ -159,7 +159,7 @@ impl Uploader {
 
         let mut upload_blobs = Vec::new();
         let mut missing_digests = StdBuckHashSet::default();
-        add_injected_missing_digests(&input_digests, &mut missing_digests)?;
+        add_injected_missing_digests(&input_digests, &mut missing_digests, digest_config)?;
 
         let digests_and_ttls_iterator = if deduplicate_get_digests_ttl_calls {
             let (fut, reqs, new) = GetDigestsTtlDeduper::get_ttls(
@@ -576,9 +576,13 @@ impl Uploader {
                 .collect::<buck2_error::Result<StdBuckHashMap<_, _>>>()?
             };
 
+        let injected = injected_missing_digests(digest_config)?;
         let missing: Vec<(ProjectRelativePathBuf, String)> = candidates
             .into_iter()
             .filter(|(_, digest)| {
+                if injected.contains(digest.data()) {
+                    return true;
+                }
                 digest_ttls
                     .get(digest)
                     .map_or(true, |ttl| *ttl <= ttl_wanted())
@@ -720,36 +724,42 @@ fn error_for_missing_file(
     )
 }
 
+/// The digests `BUCK2_TEST_INJECTED_MISSING_DIGESTS` names, which every check of the CAS reports
+/// missing whether or not the CAS holds them.
+///
+/// Both the check that decides what to upload and the recheck that decides whether a reported
+/// absence is real read this set, so a test can hold a digest missing for as long as it needs to.
+/// A test that only fooled the first check would see the recheck ask the CAS and find the blob,
+/// which is the answer for a backend that momentarily misreported it, not for one that evicted it.
+fn injected_missing_digests(digest_config: DigestConfig) -> buck2_error::Result<Vec<FileDigest>> {
+    let configured = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS",
+        applicability = testing
+    )?;
+    let Some(val) = configured else {
+        return Ok(Vec::new());
+    };
+    val.split(' ')
+        .map(|digest| {
+            let digest = TDigest::from_str(digest)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
+                .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
+            let digest = FileDigest::from_re(&digest, digest_config)?;
+            buck2_error::Ok(digest)
+        })
+        .collect()
+}
+
 /// This is used for tests. We allow an environment variable to be set to report that some digests
 /// are _always_ missing if they are required. This lets us test our upload paths more easily.
 fn add_injected_missing_digests<'a>(
     input_digests: &StdBuckHashSet<&'a TrackedFileDigest>,
     missing_digests: &mut StdBuckHashSet<&'a TrackedFileDigest>,
+    digest_config: DigestConfig,
 ) -> buck2_error::Result<()> {
-    fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
-        val.split(' ')
-            .map(|digest| {
-                let digest = TDigest::from_str(digest)
-                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
-                    .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
-                // This code does not run in a test but it is only used for testing.
-                let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
-                buck2_error::Ok(digest)
-            })
-            .collect()
-    }
-
-    let ingested_digests = buck2_env!(
-        "BUCK2_TEST_INJECTED_MISSING_DIGESTS",
-        type=Vec<FileDigest>,
-        converter=convert_digests,
-        applicability=testing
-    )?;
-    if let Some(digests) = ingested_digests {
-        for d in digests {
-            if let Some(i) = input_digests.get(d) {
-                missing_digests.insert(i);
-            }
+    for d in injected_missing_digests(digest_config)? {
+        if let Some(i) = input_digests.get(&d) {
+            missing_digests.insert(i);
         }
     }
 
