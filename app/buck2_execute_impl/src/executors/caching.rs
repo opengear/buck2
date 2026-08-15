@@ -37,6 +37,7 @@ use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::client::ActionCacheWriteType;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
+use buck2_execute::re::uploader::CasMissingRecovery;
 use dupe::Dupe;
 use futures::future;
 use futures::future::FutureExt;
@@ -411,6 +412,12 @@ impl CacheUploader {
                                 identity,
                                 digest_config,
                                 self.deduplicate_get_digests_ttl_calls,
+                                // CAS-missing recovery attributes a repair to the action whose
+                                // input digest went missing during that action's own execution
+                                // attempt. This uploads an action's outputs to the cache after
+                                // it already executed successfully, outside that action's
+                                // execution attempt, so recovery attributes nothing to it.
+                                CasMissingRecovery::Disabled,
                             )
                             .await
                             .map(|_| ())

@@ -281,6 +281,9 @@ enum ErrorTag {
   RE_CAS_ARTIFACT_INVALID_EXPIRATION = 1324;
   RE_CAS_ARTIFACT_EXPIRED = 1325;
   RE_INVALID_GET_CAS_RESPONSE = 1326;
+  // A digest a build requires was reported missing from the RE CAS, and the failure is a
+  // candidate for repair by re-executing the action that produced it.
+  RE_CAS_ARTIFACT_MISSING_RECOVERABLE = 1327;
 
   // TCodeReasonGroup values: https://fburl.com/code/pvsy2jgv
   RE_CONNECTION = 1340;

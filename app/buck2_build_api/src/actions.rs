@@ -91,6 +91,7 @@ use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 pub mod artifact;
 pub mod box_slice_set;
 pub mod calculation;
+pub mod cas_missing_recovery;
 mod error;
 pub mod error_handler;
 pub mod execute;

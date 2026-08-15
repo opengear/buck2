@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -18,12 +19,16 @@ use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_data::ToProtoMessage;
 use buck2_events::dispatch::current_span;
 use buck2_events::dispatch::span_async_simple;
+use buck2_execute::materialize::materializer::CasMissingRecoveryGuidance;
 use buck2_execute::materialize::materializer::HasMaterializer;
-use buck2_execute::materialize::materializer::MaterializationPurpose;
+use buck2_execute::materialize::materializer::MaterializationError;
+use buck2_execute::materialize::materializer::Materializer;
+use buck2_execute::materialize::materializer::cas_not_found_fatal_error;
 use buck2_util::time_span::TimeSpan;
 use dice::DiceComputations;
 use dice::DiceComputationsData;
 use dupe::Dupe;
+use futures::StreamExt;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::build_signals::HasBuildSignals;
@@ -67,9 +72,7 @@ impl ArtifactMaterializer for DiceComputationsData {
 
                 let result: buck2_error::Result<_> = try {
                     if required {
-                        materializer
-                            .ensure_materialized(vec![path], MaterializationPurpose::FinalOutput)
-                            .await?;
+                        materialize_requested_artifact(&materializer, path).await?;
                     } else {
                         materializer.try_materialize_final_artifact(path).await?;
                     }
@@ -121,4 +124,35 @@ impl ArtifactMaterializer for DiceComputations<'_> {
             )
             .await
     }
+}
+
+/// Materializes a single top-level requested artifact.
+///
+/// A CAS-missing failure here is tagged `daemon_in_memory_state_is_corrupted`, so the restarter
+/// covers a requested artifact that is itself the one that expired.
+///
+/// CAS-missing recovery attributes a repair to the action whose input digest went missing during
+/// that action's own execution attempt. A requested artifact is materialized directly, outside
+/// any execution attempt, so recovery attributes nothing to it, and the failure is always fatal
+/// with guidance telling the user to restart.
+async fn materialize_requested_artifact(
+    materializer: &Arc<dyn Materializer>,
+    path: ProjectRelativePathBuf,
+) -> buck2_error::Result<()> {
+    let mut stream = materializer.materialize_many(vec![path]).await?;
+    while let Some(res) = stream.next().await {
+        match res {
+            Ok(()) => {}
+            Err(MaterializationError::NotFound { source }) => {
+                return Err(cas_not_found_fatal_error(
+                    source,
+                    CasMissingRecoveryGuidance::RestartRequired,
+                ));
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
 }

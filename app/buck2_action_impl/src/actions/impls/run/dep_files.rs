@@ -632,11 +632,23 @@ impl DepFileBundle {
         !self.declared_dep_files.is_empty()
     }
 
+    /// Looks up the local dep file cache for an action identical to this one, and reports whether
+    /// a full dep file cache lookup is still worth doing.
+    ///
+    /// `skip_cache_lookup` reports that CAS-missing recovery invalidated this action for repair.
+    /// A repair re-run has to execute for the CAS to be repopulated, so it consults neither this
+    /// cache nor the full one: the returned pair reports a miss and stops the full lookup as
+    /// well.
     pub(crate) async fn check_local_dep_file_cache_for_identical_action(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
         declared_outputs: &[BuildArtifact],
+        skip_cache_lookup: bool,
     ) -> buck2_error::Result<(Option<(ActionOutputs, ActionExecutionMetadata)>, bool)> {
+        if skip_cache_lookup {
+            return Ok((None, false));
+        }
+
         // Get the action outputs (if cache hit) and an indicator on whether a full lookup operation should be performed
         let (outputs, check_filtered_inputs) = span_async_simple(
             buck2_data::MatchDepFilesStart {
@@ -2160,5 +2172,278 @@ mod tests {
         // A different output path is still not a match, even across configurations.
         let cfg_b_other = make(ConfigurationData::unbound(), "foo/other.h");
         assert!(!cfg_a.declares_same_dep_files(Some(&cfg_b_other)));
+    }
+}
+
+#[cfg(test)]
+mod local_dep_file_cache_lookup_tests {
+    use std::ops::ControlFlow;
+
+    use buck2_build_api::actions::execute::action_execution_target::ActionExecutionTarget;
+    use buck2_build_api::actions::execute::error::ExecuteError;
+    use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineFingerprinter;
+    use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
+    use buck2_build_api::artifact_groups::ArtifactGroupValues;
+    use buck2_common::cas_digest::CasDigest;
+    use buck2_common::io::IoProvider;
+    use buck2_core::category::Category;
+    use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+    use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_events::dispatch::EventDispatcher;
+    use buck2_execute::artifact::fs::ExecutorFs;
+    use buck2_execute::execute::blocking::BlockingExecutor;
+    use buck2_execute::execute::cache_uploader::CacheUploadResults;
+    use buck2_execute::execute::manager::CommandExecutionManager;
+    use buck2_execute::execute::prepared::PreparedAction;
+    use buck2_execute::execute::request::CommandExecutionRequest;
+    use buck2_execute::execute::request::ExecutorPreference;
+    use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
+    use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
+    use buck2_file_watcher::mergebase::Mergebase;
+    use buck2_hash::BuckHashMap;
+    use buck2_hash::BuckIndexMap;
+    use buck2_hash::BuckIndexSet;
+    use buck2_http::HttpClient;
+    use dice_futures::cancellation::CancellationContext;
+    use futures::executor::block_on;
+    use remote_execution::TActionResult2;
+
+    use super::*;
+
+    /// An [`ActionExecutionCtx`] whose every method panics, naming itself in the panic message.
+    ///
+    /// A working fake would answer every call, leaving a bypassed lookup indistinguishable from
+    /// one that ran. Panicking makes any access to the dep file map, materializer, filesystem, or
+    /// cache fail the test, so a lookup that returns proves the bypass held.
+    struct PanickingActionExecutionCtx;
+
+    #[async_trait]
+    impl ActionExecutionCtx for PanickingActionExecutionCtx {
+        fn target(&self) -> ActionExecutionTarget<'_> {
+            unimplemented!("target")
+        }
+
+        fn fs(&self) -> &ArtifactFs {
+            unimplemented!("fs")
+        }
+
+        fn executor_fs(&self) -> ExecutorFs<'_> {
+            unimplemented!("executor_fs")
+        }
+
+        fn materializer(&self) -> &dyn Materializer {
+            unimplemented!("materializer")
+        }
+
+        fn events(&self) -> &EventDispatcher {
+            unimplemented!("events")
+        }
+
+        fn command_execution_manager(&self, _waiting_data: WaitingData) -> CommandExecutionManager {
+            unimplemented!("command_execution_manager")
+        }
+
+        fn mergebase(&self) -> &Mergebase {
+            unimplemented!("mergebase")
+        }
+
+        fn prepare_action(
+            &mut self,
+            _request: &CommandExecutionRequest,
+            _re_outputs_required: bool,
+        ) -> buck2_error::Result<PreparedAction> {
+            unimplemented!("prepare_action")
+        }
+
+        async fn action_cache(
+            &mut self,
+            _manager: CommandExecutionManager,
+            _request: &CommandExecutionRequest,
+            _prepared_action: &PreparedAction,
+        ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+            unimplemented!("action_cache")
+        }
+
+        async fn remote_dep_file_cache(
+            &mut self,
+            _manager: CommandExecutionManager,
+            _request: &CommandExecutionRequest,
+            _prepared_action: &PreparedAction,
+        ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+            unimplemented!("remote_dep_file_cache")
+        }
+
+        async fn cache_upload(
+            &mut self,
+            _action: &ActionDigestAndBlobs,
+            _execution_result: &CommandExecutionResult,
+            _re_result: Option<TActionResult2>,
+            _dep_file_entry: Option<&mut dyn IntoRemoteDepFile>,
+        ) -> buck2_error::Result<CacheUploadResults> {
+            unimplemented!("cache_upload")
+        }
+
+        async fn exec_cmd(
+            &mut self,
+            _manager: CommandExecutionManager,
+            _request: &CommandExecutionRequest,
+            _prepared_action: &PreparedAction,
+        ) -> CommandExecutionResult {
+            unimplemented!("exec_cmd")
+        }
+
+        fn unpack_command_execution_result(
+            &mut self,
+            _executor_preference: ExecutorPreference,
+            _result: CommandExecutionResult,
+            _allows_cache_upload: bool,
+            _allows_dep_file_cache_upload: bool,
+            _input_files_bytes: Option<u64>,
+            _incremental_kind: buck2_data::IncrementalKind,
+        ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+            unimplemented!("unpack_command_execution_result")
+        }
+
+        async fn cleanup_outputs(&mut self) -> buck2_error::Result<()> {
+            unimplemented!("cleanup_outputs")
+        }
+
+        fn artifact_values(&self, _input: &ArtifactGroup) -> &ArtifactGroupValues {
+            unimplemented!("artifact_values")
+        }
+
+        fn artifact_path_mapping(
+            &self,
+            _filter: Option<BuckIndexSet<ArtifactGroup>>,
+        ) -> BuckHashMap<&Artifact, ContentBasedPathHash> {
+            unimplemented!("artifact_path_mapping")
+        }
+
+        fn blocking_executor(&self) -> &dyn BlockingExecutor {
+            unimplemented!("blocking_executor")
+        }
+
+        fn re_client(&self) -> UnconfiguredRemoteExecutionClient {
+            unimplemented!("re_client")
+        }
+
+        fn re_platform(&self) -> &remote_execution::Platform {
+            unimplemented!("re_platform")
+        }
+
+        fn digest_config(&self) -> DigestConfig {
+            unimplemented!("digest_config")
+        }
+
+        fn run_action_knobs(&self) -> &RunActionKnobs {
+            unimplemented!("run_action_knobs")
+        }
+
+        fn cancellation_context(&self) -> &CancellationContext {
+            unimplemented!("cancellation_context")
+        }
+
+        fn io_provider(&self) -> Arc<dyn IoProvider> {
+            unimplemented!("io_provider")
+        }
+
+        fn http_client(&self) -> HttpClient {
+            unimplemented!("http_client")
+        }
+
+        fn output_trees_download_config(&self) -> &OutputTreesDownloadConfig {
+            unimplemented!("output_trees_download_config")
+        }
+    }
+
+    /// The key of the action `dep_file_bundle` describes. `identifier` gives each test its own key
+    /// in the process-wide dep file map.
+    fn dep_files_key(identifier: &str) -> RunActionKey {
+        RunActionKey::new(
+            BaseDeferredKey::TargetLabel(ConfiguredTargetLabel::testing_parse(
+                "cell//pkg:foo",
+                ConfigurationData::testing_new(),
+            )),
+            Category::new("cxx_compile".to_owned()).unwrap(),
+            Some(identifier.to_owned()),
+        )
+    }
+
+    fn input_directory_digest() -> FileDigest {
+        CasDigest::new_sha1([1; 20], 1)
+    }
+
+    /// A bundle for an action with no dep file declaration of its own, matching the state
+    /// [`record_identical_action`] records for it.
+    fn dep_file_bundle(identifier: &str) -> DepFileBundle {
+        DepFileBundle {
+            dep_files_key: dep_files_key(identifier),
+            input_directory_digest: input_directory_digest(),
+            shared_declared_inputs: None,
+            declared_dep_files: DeclaredDepFiles {
+                tagged: OrderedMap::new(),
+            },
+            filtered_input_fingerprints: None,
+            common_digests: CommonDigests {
+                commandline_cli_digest: ExpandedCommandLineFingerprinter::new().finalize(),
+                output_paths_digest: get_output_path_digest(DigestConfig::testing_default(), &[]),
+                untagged_inputs_digest: TrackedFileDigest::new(
+                    CasDigest::new_sha1([2; 20], 1),
+                    CasDigestConfig::testing_default(),
+                ),
+                local_worker_inputs_digest: None,
+            },
+        }
+    }
+
+    /// Records the action `dep_file_bundle(identifier)` describes in the local dep file cache with
+    /// the same command line and input directory, which is the state a repeated build of an
+    /// unchanged action leaves behind and the one a lookup reports as a hit.
+    fn record_identical_action(identifier: &str) {
+        DEP_FILES.insert(
+            dep_files_key(identifier),
+            Arc::new(DepFileState {
+                digests: CommandDigests {
+                    cli: ExpandedCommandLineFingerprinter::new().finalize(),
+                    directory: input_directory_digest(),
+                    local_worker_directory: None,
+                },
+                result: ActionOutputs::new(BuckIndexMap::new()),
+                was_produced_locally: true,
+                has_declared_dep_files: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn an_action_invalidated_for_repair_consults_no_dep_file_cache() {
+        // The dep file cache holds a hit for this action, so a lookup would return its cached
+        // outputs and the re-run would execute nothing, leaving the CAS as broken as it found it.
+        // Finishing against a context that panics on every method proves the lookup was bypassed
+        // rather than merely missing.
+        record_identical_action("repair");
+        let bundle = dep_file_bundle("repair");
+        let mut ctx = PanickingActionExecutionCtx;
+
+        let (outputs, should_fully_check_dep_file_cache) =
+            block_on(bundle.check_local_dep_file_cache_for_identical_action(&mut ctx, &[], true))
+                .expect("bypassing the lookup is infallible");
+
+        assert!(outputs.is_none());
+        assert!(!should_fully_check_dep_file_cache);
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented: fs")]
+    fn an_action_running_normally_consults_the_dep_file_cache() {
+        // The same recorded hit as the repair case: reaching `ctx.fs()`, which the lookup calls to
+        // resolve the cached outputs it found, is the cache access the repair case must avoid.
+        record_identical_action("normal");
+        let bundle = dep_file_bundle("normal");
+        let mut ctx = PanickingActionExecutionCtx;
+
+        let _ =
+            block_on(bundle.check_local_dep_file_cache_for_identical_action(&mut ctx, &[], false));
     }
 }

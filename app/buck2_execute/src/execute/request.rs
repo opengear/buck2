@@ -412,6 +412,19 @@ pub struct CommandExecutionRequest {
     /// ignoring the inherited `network_access` policy; no effect on RE. Set by the test
     /// orchestrator's `disable_local_network_isolation`, which explains the rationale.
     disable_local_network_isolation: bool,
+
+    /// Whether this command must bypass every cache lookup — the action cache, the RE cache, and
+    /// the remote and local dep-file caches — and execute unconditionally.
+    ///
+    /// CAS-missing recovery sets this for a command whose action it invalidated for repair: any
+    /// cached result would hand back the digest that was reported missing, making a cache-served
+    /// re-run a no-op instead of a repair.
+    skip_cache_lookup: bool,
+
+    /// When enabled, an action execution failure caused by a missing RE CAS digest identifies
+    /// the producing action and marks it for re-execution. When disabled, the failure is fatal
+    /// and fails the build.
+    cas_missing_recovery_enabled: bool,
 }
 
 impl CommandExecutionRequest {
@@ -451,6 +464,8 @@ impl CommandExecutionRequest {
             skip_resource_control: false,
             network_access: None,
             disable_local_network_isolation: false,
+            skip_cache_lookup: false,
+            cas_missing_recovery_enabled: false,
         }
     }
 
@@ -527,6 +542,24 @@ impl CommandExecutionRequest {
 
     pub fn outputs_cleanup(&self) -> bool {
         self.outputs_cleanup
+    }
+
+    pub fn with_skip_cache_lookup(mut self, skip_cache_lookup: bool) -> Self {
+        self.skip_cache_lookup = skip_cache_lookup;
+        self
+    }
+
+    pub fn skip_cache_lookup(&self) -> bool {
+        self.skip_cache_lookup
+    }
+
+    pub fn with_cas_missing_recovery_enabled(mut self, cas_missing_recovery_enabled: bool) -> Self {
+        self.cas_missing_recovery_enabled = cas_missing_recovery_enabled;
+        self
+    }
+
+    pub fn cas_missing_recovery_enabled(&self) -> bool {
+        self.cas_missing_recovery_enabled
     }
 
     pub fn all_args(&self) -> impl Iterator<Item = &String> {

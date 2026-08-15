@@ -23,7 +23,9 @@ use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
+use buck2_core::tag_error;
 use buck2_data::ReUploadMetrics;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
@@ -61,6 +63,7 @@ use crate::directory::ActionFingerprintedDirectoryRef;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
+use crate::execute::missing_cas_digests::MissingCasDigests;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::MaterializationPurpose;
@@ -75,6 +78,38 @@ pub struct UploadStats {
     pub total: ReUploadMetrics,
     pub by_extension: IntentionallyStdHashMap<String, ReUploadMetrics>,
 }
+
+/// Whether CAS-missing recovery is enabled for this upload's build.
+///
+/// When enabled, a CAS-missing input bypasses the action-age heuristic and instead re-probes the
+/// CAS for exactly the digests reported missing, reporting any still absent as recoverable rather
+/// than fatal.
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq)]
+pub enum CasMissingRecovery {
+    Disabled,
+    Enabled,
+}
+
+impl From<bool> for CasMissingRecovery {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+/// Dedupes concurrent `GetDigestsTtl` calls for the same digest, shared across every caller in
+/// this process so an upload's own TTL check and a CAS-missing re-probe folded into the same
+/// window make one round trip instead of two.
+///
+/// One instance serves the whole process and it has no reset hook, so a test that drives the
+/// deduplicated path shares it with every test running concurrently in the same binary: such a
+/// test must use digests unique to itself, and must expect a digest another test already
+/// registered to resolve from that test's in-flight query.
+static GET_DIGESTS_TTL_DEDUP: LazyLock<Mutex<GetDigestsTtlDeduper>> =
+    LazyLock::new(|| Mutex::new(GetDigestsTtlDeduper::default()));
 
 pub struct Uploader {}
 
@@ -127,19 +162,14 @@ impl Uploader {
         add_injected_missing_digests(&input_digests, &mut missing_digests)?;
 
         let digests_and_ttls_iterator = if deduplicate_get_digests_ttl_calls {
-            let (fut, reqs, new) = {
-                static GET_DIGESTS_TTL_DEDUP: LazyLock<Mutex<GetDigestsTtlDeduper>> =
-                    LazyLock::new(|| Mutex::new(GetDigestsTtlDeduper::default()));
-
-                GetDigestsTtlDeduper::get_ttls(
-                    &GET_DIGESTS_TTL_DEDUP,
-                    client,
-                    *use_case,
-                    identity,
-                    digest_config,
-                    input_digests.iter().copied(),
-                )
-            };
+            let (fut, reqs, new) = GetDigestsTtlDeduper::get_ttls(
+                &GET_DIGESTS_TTL_DEDUP,
+                client,
+                *use_case,
+                identity,
+                digest_config,
+                input_digests.iter().copied(),
+            );
 
             tracing::debug!(
                 "Requested digests for {}: {:#?}: {} futures, {} newly dispatched digests",
@@ -245,6 +275,7 @@ impl Uploader {
         identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
         deduplicate_get_digests_ttl_calls: bool,
+        cas_missing_recovery: CasMissingRecovery,
     ) -> buck2_error::Result<UploadStats> {
         let (mut upload_blobs, mut missing_digests) = Self::find_missing(
             client,
@@ -315,6 +346,12 @@ impl Uploader {
                 .get_materialized_file_paths(upload_file_paths)
                 .await?;
 
+            // Every digest a re-probe is needed for, collected across the whole loop, so a single
+            // re-probe and a single structured error cover every action a repair could recover in
+            // this upload.
+            let mut recheck_candidates: Vec<(ProjectRelativePathBuf, TrackedFileDigest)> =
+                Vec::new();
+
             for (name, digest) in upload_file_paths.into_iter().zip(upload_file_digests) {
                 match name {
                     Ok(name) => {
@@ -326,9 +363,9 @@ impl Uploader {
                     }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::RequiresCasDownload {
+                            ref path,
                             ref entry,
                             ref info,
-                            ..
                         },
                     ) => {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) =
@@ -339,41 +376,47 @@ impl Uploader {
                             // won't be here. On the flip side, if a digest has been in the CAS for
                             // a very long time, it might have expired.
                             if file.digest.to_re() == digest {
-                                if should_error_for_missing_digest(info) {
-                                    soft_error!(
-                                        "cas_missing_fatal",
-                                        buck2_error::buck2_error!(
-                                            buck2_error::ErrorTag::Input,
-                                            "{} missing (origin: {})",
-                                            file.digest,
-                                            info.origin.as_display_for_not_found(),
-                                        ),
-                                        daemon_in_memory_state_is_corrupted: true,
-                                        action_cache_is_corrupted: info.origin.guaranteed_by_action_cache()
-                                    )?;
+                                match outcome_for_missing_digest(cas_missing_recovery, info) {
+                                    MissingDigestOutcome::Recheck => {
+                                        recheck_candidates.push((path.clone(), file.digest.dupe()));
+                                    }
+                                    MissingDigestOutcome::Fail => {
+                                        soft_error!(
+                                            "cas_missing_fatal",
+                                            buck2_error::buck2_error!(
+                                                buck2_error::ErrorTag::Input,
+                                                "{} missing (origin: {})",
+                                                file.digest,
+                                                info.origin.as_display_for_not_found(),
+                                            ),
+                                            daemon_in_memory_state_is_corrupted: true,
+                                            action_cache_is_corrupted: info.origin.guaranteed_by_action_cache()
+                                        )?;
 
-                                    return Err(buck2_error::buck2_error!(
-                                        buck2_error::ErrorTag::ReCasArtifactExpired,
-                                        "Your build requires an artifact that has expired in the RE CAS \
-                                        and Buck does not have it. This likely happened because your Buck daemon \
-                                        has been online for a long time. This error is currently unrecoverable. \
-                                        To proceed, you should restart Buck using `buck2 killall`. \
-                                        Debug information: {:#}",
-                                        err
-                                    ));
+                                        return Err(buck2_error::buck2_error!(
+                                            buck2_error::ErrorTag::ReCasArtifactExpired,
+                                            "Your build requires an artifact that has expired in the RE CAS \
+                                            and Buck does not have it. This likely happened because your Buck daemon \
+                                            has been online for a long time. This error is currently unrecoverable. \
+                                            To proceed, you should restart Buck using `buck2 killall`. \
+                                            Debug information: {:#}",
+                                            err
+                                        ));
+                                    }
+                                    MissingDigestOutcome::ReportQuietly => {
+                                        soft_error!(
+                                            "cas_missing",
+                                            buck2_error::buck2_error!(
+                                                buck2_error::ErrorTag::Input,
+                                                "{} (expires = {}) is missing in the CAS but expected to exist as per: {:#}",
+                                                file.digest,
+                                                file.digest.expires()?,
+                                                err
+                                            ),
+                                            quiet: true
+                                        )?;
+                                    }
                                 }
-
-                                soft_error!(
-                                    "cas_missing",
-                                    buck2_error::buck2_error!(
-                                        buck2_error::ErrorTag::Input,
-                                        "{} (expires = {}) is missing in the CAS but expected to exist as per: {:#}",
-                                        file.digest,
-                                        file.digest.expires()?,
-                                        err
-                                    ),
-                                    quiet: true
-                                )?;
 
                                 continue;
                             }
@@ -397,6 +440,18 @@ impl Uploader {
                         return Err(error_for_missing_file(&digest, err));
                     }
                 };
+            }
+
+            if !recheck_candidates.is_empty() {
+                Self::error_for_still_missing_after_recheck(
+                    client,
+                    &use_case,
+                    identity,
+                    digest_config,
+                    deduplicate_get_digests_ttl_calls,
+                    recheck_candidates,
+                )
+                .await?;
             }
         }
 
@@ -476,6 +531,137 @@ impl Uploader {
         };
 
         Ok(stats)
+    }
+
+    /// Re-probes the CAS for exactly the digests a materialization reported missing, and turns
+    /// the subset still absent into a recoverable, structured error. A digest present on the
+    /// re-probe needs no further action here: it was reported missing because the materializer's
+    /// query raced with an upload that has since landed.
+    ///
+    /// The error states only the technical facts about what is missing. The guidance shown to
+    /// the user — whether the daemon queued a repair or the failure is fatal — is decided by
+    /// whichever caller attributes the missing digests to a producing action, once attribution
+    /// has actually run.
+    async fn error_for_still_missing_after_recheck(
+        client: &RemoteExecutionClient,
+        use_case: &RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
+        digest_config: DigestConfig,
+        deduplicate_get_digests_ttl_calls: bool,
+        candidates: Vec<(ProjectRelativePathBuf, TrackedFileDigest)>,
+    ) -> buck2_error::Result<()> {
+        let digest_ttls: StdBuckHashMap<TrackedFileDigest, i64> =
+            if deduplicate_get_digests_ttl_calls {
+                let (fut, _reqs, _new) = GetDigestsTtlDeduper::get_ttls(
+                    &GET_DIGESTS_TTL_DEDUP,
+                    client,
+                    *use_case,
+                    identity,
+                    digest_config,
+                    candidates.iter().map(|(_, digest)| digest),
+                );
+                fut.await?
+            } else {
+                let digests = candidates
+                    .iter()
+                    .map(|(_, digest)| digest.to_re())
+                    .collect();
+                let metadata = use_case.metadata(identity);
+                let response = client.get_digests_ttl(digests, &metadata, true).await?;
+                process_get_digest_ttls_response(
+                    candidates.iter().map(|(_, digest)| digest.dupe()).collect(),
+                    response,
+                    digest_config,
+                )?
+                .collect::<buck2_error::Result<StdBuckHashMap<_, _>>>()?
+            };
+
+        let missing: Vec<(ProjectRelativePathBuf, String)> = candidates
+            .into_iter()
+            .filter(|(_, digest)| {
+                digest_ttls
+                    .get(digest)
+                    .map_or(true, |ttl| *ttl <= ttl_wanted())
+            })
+            .map(|(path, digest)| (path, digest.to_string()))
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let count = missing.len();
+        let summary = format_missing_summary(&missing);
+        let err = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::ReCasArtifactMissingRecoverable,
+            "Your build requires {} artifact(s) that are missing from the RE CAS.\n{}",
+            count,
+            summary,
+        )
+        .context(MissingCasDigests { missing });
+
+        Err(tag_error!("cas_missing_recoverable", err, quiet: true))
+    }
+}
+
+/// The minimum TTL, in seconds, a digest must have for buck2 to treat it as present in the CAS
+/// without needing to (re)upload or repair it. Shared by every digest-freshness check in this
+/// file so "missing from the CAS" means the same thing everywhere it is decided.
+fn ttl_wanted() -> i64 {
+    if buck2_core::is_open_source() { 1 } else { 600 }
+}
+
+const MAX_MISSING_SUMMARY_ENTRIES: usize = 10;
+
+/// Formats up to [`MAX_MISSING_SUMMARY_ENTRIES`] `path: digest` lines describing digests reported
+/// missing from the RE CAS, capping the message length for a build with many affected artifacts.
+fn format_missing_summary(missing: &[(ProjectRelativePathBuf, String)]) -> String {
+    let mut result = String::new();
+    for (path, digest) in missing.iter().take(MAX_MISSING_SUMMARY_ENTRIES) {
+        result.push_str(&format!("  {path}: {digest}\n"));
+    }
+    if missing.len() > MAX_MISSING_SUMMARY_ENTRIES {
+        result.push_str(&format!(
+            "  ... and {} more omitted",
+            missing.len() - MAX_MISSING_SUMMARY_ENTRIES
+        ));
+    }
+    result
+}
+
+/// What an upload does about an input digest the materializer can only get from the CAS, where
+/// the CAS reports the digest missing.
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq)]
+enum MissingDigestOutcome {
+    /// Re-probe the CAS for this digest, and report it as recoverable if it is still absent, so
+    /// the daemon can identify the producing action and re-run it.
+    Recheck,
+    /// Fail the build and tell the user to restart the daemon.
+    Fail,
+    /// Report the digest quietly and continue the upload.
+    ReportQuietly,
+}
+
+/// Decides what an upload does about a digest the CAS reports missing.
+///
+/// A build that opted into CAS-missing recovery always re-probes: the re-probe both filters out
+/// the digests RE reported missing in error and produces the recoverable error the daemon needs
+/// to attribute the rest to a producing action. Every other build decides between failing and
+/// continuing by the action-age heuristic in [`should_error_for_missing_digest`] alone, and
+/// issues no re-probe.
+fn outcome_for_missing_digest(
+    cas_missing_recovery: CasMissingRecovery,
+    info: &CasDownloadInfo,
+) -> MissingDigestOutcome {
+    match cas_missing_recovery {
+        CasMissingRecovery::Enabled => MissingDigestOutcome::Recheck,
+        CasMissingRecovery::Disabled => {
+            if should_error_for_missing_digest(info) {
+                MissingDigestOutcome::Fail
+            } else {
+                MissingDigestOutcome::ReportQuietly
+            }
+        }
     }
 }
 
@@ -761,4 +947,207 @@ where
 
             Ok((digest, digest_ttl))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_common::cas_digest::CasDigestConfig;
+    use chrono::Duration as ChronoDuration;
+    use chrono::Utc;
+    use remote_execution::DigestWithTtl;
+
+    use super::*;
+    use crate::execute::action_digest::TrackedActionDigest;
+
+    fn action_digest() -> TrackedActionDigest {
+        TrackedActionDigest::new(
+            buck2_common::cas_digest::CasDigest::new_sha1([0; 20], 1),
+            CasDigestConfig::testing_default(),
+        )
+    }
+
+    fn executed_hours_ago(hours: i64) -> CasDownloadInfo {
+        CasDownloadInfo::new_execution(
+            action_digest(),
+            RemoteExecutorUseCase::buck2_default(),
+            Utc::now() - ChronoDuration::hours(hours),
+            ChronoDuration::hours(1),
+        )
+    }
+
+    fn declared() -> CasDownloadInfo {
+        CasDownloadInfo::new_declared(RemoteExecutorUseCase::buck2_default())
+    }
+
+    #[test]
+    fn a_build_without_recovery_decides_a_missing_digest_by_action_age_alone() {
+        // Recovery is opt-in. `Recheck` is the outcome that issues a second `GetDigestsTtl` round
+        // trip, so a build that did not opt in resolves to `Fail` or `ReportQuietly` and keeps the
+        // RE traffic the action-age heuristic alone dictates.
+        let cases = [
+            (
+                "action old enough for RE's missing report to be trusted",
+                CasMissingRecovery::Disabled,
+                executed_hours_ago(6),
+                MissingDigestOutcome::Fail,
+            ),
+            (
+                "action too recent for RE's missing report to be trusted",
+                CasMissingRecovery::Disabled,
+                executed_hours_ago(0),
+                MissingDigestOutcome::ReportQuietly,
+            ),
+            (
+                "declared origin, which never executed and so lacks an age to compare against",
+                CasMissingRecovery::Disabled,
+                declared(),
+                MissingDigestOutcome::Fail,
+            ),
+        ];
+
+        for (scenario, recovery, info, expected) in cases {
+            assert_eq!(
+                outcome_for_missing_digest(recovery, &info),
+                expected,
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_with_recovery_rechecks_a_missing_digest_whatever_the_action_age() {
+        // The re-probe replaces the age heuristic outright: recovery needs the digests that are
+        // really absent, and an action young enough to be quietly ignored produces the same
+        // broken build as an old one once its artifact is truly gone from the CAS.
+        let cases = [
+            ("old action", executed_hours_ago(6)),
+            ("recent action", executed_hours_ago(0)),
+            ("declared origin", declared()),
+        ];
+
+        for (scenario, info) in cases {
+            assert_eq!(
+                outcome_for_missing_digest(CasMissingRecovery::Enabled, &info),
+                MissingDigestOutcome::Recheck,
+                "{scenario}"
+            );
+        }
+    }
+
+    fn tracked_digest(byte: u8) -> TrackedFileDigest {
+        TrackedFileDigest::new(
+            buck2_common::cas_digest::CasDigest::new_sha1([byte; 20], 1),
+            CasDigestConfig::testing_default(),
+        )
+    }
+
+    #[test]
+    fn ttl_wanted_is_positive() {
+        // The exact threshold differs between OSS and internal builds; every caller that treats
+        // a digest as missing below this threshold needs it to be a real, positive TTL.
+        assert!(ttl_wanted() > 0);
+    }
+
+    #[test]
+    fn format_missing_summary_lists_every_entry_under_the_cap() {
+        let missing = vec![
+            (
+                ProjectRelativePathBuf::unchecked_new("a".to_owned()),
+                "aa:1".to_owned(),
+            ),
+            (
+                ProjectRelativePathBuf::unchecked_new("b".to_owned()),
+                "bb:2".to_owned(),
+            ),
+        ];
+
+        let summary = format_missing_summary(&missing);
+
+        assert!(summary.contains("a: aa:1"));
+        assert!(summary.contains("b: bb:2"));
+        assert!(!summary.contains("omitted"));
+    }
+
+    #[test]
+    fn format_missing_summary_caps_and_reports_the_omitted_count() {
+        let missing: Vec<_> = (0..MAX_MISSING_SUMMARY_ENTRIES + 3)
+            .map(|i| {
+                (
+                    ProjectRelativePathBuf::unchecked_new(format!("path{i}")),
+                    format!("digest{i}"),
+                )
+            })
+            .collect();
+
+        let summary = format_missing_summary(&missing);
+
+        assert!(summary.contains("path0"));
+        assert!(!summary.contains(&format!("path{MAX_MISSING_SUMMARY_ENTRIES}")));
+        assert!(summary.contains("3 more omitted"));
+    }
+
+    #[test]
+    fn process_get_digest_ttls_response_matches_requested_digests_to_their_ttl() {
+        let digest_config = DigestConfig::testing_default();
+        let digest = tracked_digest(1);
+        let response = GetDigestsTtlResponse {
+            digests_with_ttl: vec![DigestWithTtl {
+                digest: digest.to_re(),
+                ttl: 600,
+            }],
+        };
+
+        let results: Vec<_> =
+            process_get_digest_ttls_response(vec![digest.dupe()], response, digest_config)
+                .expect("matching response should not error")
+                .collect::<buck2_error::Result<Vec<_>>>()
+                .expect("every requested digest should resolve");
+
+        assert_eq!(results, vec![(digest, 600)]);
+    }
+
+    #[test]
+    fn process_get_digest_ttls_response_errors_on_a_truncated_response() {
+        let digest_config = DigestConfig::testing_default();
+        let requested = vec![tracked_digest(1), tracked_digest(2)];
+        let response = GetDigestsTtlResponse {
+            digests_with_ttl: vec![DigestWithTtl {
+                digest: tracked_digest(1).to_re(),
+                ttl: 600,
+            }],
+        };
+
+        let err = process_get_digest_ttls_response(requested, response, digest_config)
+            .err()
+            .expect("a response shorter than the request must be rejected");
+
+        assert!(
+            err.tags()
+                .contains(&buck2_error::ErrorTag::ReInvalidGetCasResponse)
+        );
+        assert!(format!("{err}").contains("expected 2, got 1"));
+    }
+
+    #[test]
+    fn process_get_digest_ttls_response_errors_on_a_mismatched_digest() {
+        let digest_config = DigestConfig::testing_default();
+        let requested = vec![tracked_digest(1)];
+        let response = GetDigestsTtlResponse {
+            digests_with_ttl: vec![DigestWithTtl {
+                // Same count as requested, but a digest RE never got asked about.
+                digest: tracked_digest(2).to_re(),
+                ttl: 600,
+            }],
+        };
+
+        let err = process_get_digest_ttls_response(requested, response, digest_config)
+            .expect("response length matches; the mismatch is per-entry")
+            .collect::<buck2_error::Result<Vec<_>>>()
+            .expect_err("a digest the request never asked about must be rejected");
+
+        assert!(
+            err.tags()
+                .contains(&buck2_error::ErrorTag::ReInvalidGetCasResponse)
+        );
+    }
 }

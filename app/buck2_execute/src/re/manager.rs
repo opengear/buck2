@@ -61,6 +61,7 @@ use crate::re::client::RemoteExecutionClient;
 use crate::re::metadata::RemoteExecutionMetadataExt;
 use crate::re::re_get_session_id::ReGetSessionId;
 use crate::re::stats::RemoteExecutionClientStats;
+use crate::re::uploader::CasMissingRecovery;
 use crate::re::uploader::UploadStats;
 
 /// Lifetime management of the Remote Execution connection (i.e. the RemoteExecutionClient).
@@ -386,6 +387,7 @@ impl ManagedRemoteExecutionClient {
         identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
         deduplicate_get_digests_ttl_calls: bool,
+        cas_missing_recovery: CasMissingRecovery,
     ) -> buck2_error::Result<UploadStats> {
         self.lock()?
             .get()
@@ -400,6 +402,7 @@ impl ManagedRemoteExecutionClient {
                 identity,
                 digest_config,
                 deduplicate_get_digests_ttl_calls,
+                cas_missing_recovery,
             )
             .await
     }

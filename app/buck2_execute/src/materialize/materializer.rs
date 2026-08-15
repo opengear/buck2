@@ -19,6 +19,7 @@ use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::tag_error;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::ordered_entry_walk;
@@ -91,25 +92,84 @@ fn format_directory_entry_leaves(
     result
 }
 
+/// The advice shown to the user for a CAS-missing materialization failure, chosen at the site
+/// that decides whether this failure is fatal.
+///
+/// CAS-missing recovery attributes a repair to the action whose input digest went missing
+/// during that action's own execution attempt. A failure hit while recovery is disabled, or one
+/// on a requested artifact materialized outside any execution attempt, falls outside that
+/// attribution and stays unrecoverable, so the guidance tells the user to restart with `buck2
+/// killall`. A failure hit while recovery is enabled may still be queued for automatic
+/// re-execution once the build layer attributes it to a producing action, so the guidance tells
+/// the user to retry instead of restarting: a restart would discard the in-memory registry a
+/// queued repair depends on.
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq)]
+pub enum CasMissingRecoveryGuidance {
+    RestartRequired,
+    RecoveryEnabled,
+}
+
+impl fmt::Display for CasMissingRecoveryGuidance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RestartRequired => {
+                "This error is currently unrecoverable. To proceed, you should restart Buck \
+                using `buck2 killall`."
+            }
+            Self::RecoveryEnabled => {
+                "CAS-missing recovery is enabled for this build. If Buck2 can identify the \
+                action that produced this artifact, it is queued for automatic re-execution on \
+                your next build. Restarting Buck with `buck2 killall` would discard a queued \
+                repair, so retry your build before restarting."
+            }
+        })
+    }
+}
+
 #[derive(buck2_error::Error, Debug, Clone, Dupe)]
 #[error(
     "Your build requires materializing an artifact that has expired in the \
     RE CAS and Buck does not have it. \
     This likely happened because your Buck daemon \
-    has been online for a long time. This error is currently unrecoverable. \
-    To proceed, you should restart Buck using `buck2 killall`.
+    has been online for a long time. {}
 
 Debug information:
   Path: {}
   Digest origin: {}
-  Directory:\n{}", .path, .info.origin.as_display_for_not_found(), format_directory_entry_leaves(.directory))]
+  Directory:\n{}", .recovery, .path, .info.origin.as_display_for_not_found(), format_directory_entry_leaves(.directory))]
 #[buck2(tag = MaterializationError)]
 pub struct CasNotFoundError {
     pub path: Arc<ProjectRelativePathBuf>,
     pub info: Arc<CasDownloadInfo>,
     pub directory: ActionDirectoryEntry<ActionSharedDirectory>,
+    pub recovery: CasMissingRecoveryGuidance,
     #[source]
     pub error: Arc<buck2_error::Error>,
+}
+
+/// Builds the fatal error for a CAS-missing materialization failure, selecting the restart
+/// guidance appropriate to whether CAS-missing recovery could attribute this failure to a
+/// producing action.
+///
+/// Tagged `ReCasArtifactMissingRecoverable` in addition to this error's own `MaterializationError`
+/// tag, so a digest missing from the CAS classifies the same way whether it was detected here or
+/// during upload: on what happened, not on which site detected it.
+pub fn cas_not_found_fatal_error(
+    source: CasNotFoundError,
+    recovery: CasMissingRecoveryGuidance,
+) -> buck2_error::Error {
+    let corrupted = source.info.origin.guaranteed_by_action_cache();
+    let source = CasNotFoundError { recovery, ..source };
+    let error: buck2_error::Error = tag_error!(
+        "cas_missing_fatal",
+        MaterializationError::NotFound { source }.into(),
+        quiet: true,
+        task: false,
+        daemon_in_memory_state_is_corrupted: true,
+        action_cache_is_corrupted: corrupted
+    )
+    .into();
+    error.tag([buck2_error::ErrorTag::ReCasArtifactMissingRecoverable])
 }
 
 #[derive(buck2_error::Error, Debug)]

@@ -115,6 +115,7 @@ use crate::re::stats::LocalCacheStats;
 use crate::re::stats::OpStats;
 use crate::re::stats::RemoteExecutionClientOpStats;
 use crate::re::stats::RemoteExecutionClientStats;
+use crate::re::uploader::CasMissingRecovery;
 use crate::re::uploader::UploadStats;
 use crate::re::uploader::Uploader;
 
@@ -276,6 +277,7 @@ impl RemoteExecutionClient {
         identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
         deduplicate_get_digests_ttl_calls: bool,
+        cas_missing_recovery: CasMissingRecovery,
     ) -> buck2_error::Result<UploadStats> {
         // Actually upload to CAS
         let _cas = self.data.client.cas_semaphore.acquire().await;
@@ -293,6 +295,7 @@ impl RemoteExecutionClient {
                 identity,
                 digest_config,
                 deduplicate_get_digests_ttl_calls,
+                cas_missing_recovery,
             ))
             .await
     }

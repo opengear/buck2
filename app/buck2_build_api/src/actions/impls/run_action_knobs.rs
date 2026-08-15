@@ -32,6 +32,13 @@ pub struct RunActionKnobs {
         Option<DashMapDirectoryInterner<ActionDirectoryMember, TrackedFileDigest>>,
 
     pub deduplicate_get_digests_ttl_calls: bool,
+
+    pub re_outputs_required: bool,
+
+    /// When enabled, an action execution failure caused by a missing RE CAS digest identifies
+    /// the producing action and marks it for re-execution. When disabled, the failure is fatal
+    /// and fails the build.
+    pub cas_missing_recovery_enabled: bool,
 }
 
 pub trait HasRunActionKnobs {
