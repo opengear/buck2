@@ -40,6 +40,7 @@ BUCK2_TEST_DISABLE_CACHING                     bool
 BUCK2_TEST_DISABLE_DAEMON_CGROUP               bool
 BUCK2_TEST_DISABLE_LOG_UPLOAD                  bool                  false
 BUCK2_TEST_ERROR_ON_CACHE_UPLOAD               bool                  false
+BUCK2_TEST_EVICTED_DIGESTS                     String
 BUCK2_TEST_EXTRA_EXTERNAL_CONFIG               String
 BUCK2_TEST_FAIL_BUCKD_AUTH                     bool                  false
 BUCK2_TEST_FAIL_CONNECT                        bool                  false

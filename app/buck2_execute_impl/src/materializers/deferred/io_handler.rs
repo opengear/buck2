@@ -56,6 +56,7 @@ use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::fs_util::ReadDir;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+use buck2_hash::BuckDashSet;
 use buck2_hash::StdBuckHashMap;
 use buck2_hash::StdBuckHashSet;
 use buck2_http::HttpClient;
@@ -648,10 +649,10 @@ fn collect_entry_digests(
     missing
 }
 
-/// Parses `BUCK2_TEST_TOMBSTONED_DIGESTS` under `digest_config`, so a digest names the same
-/// blob the daemon addresses. A backend the daemon talks to in SHA256, which every REAPI server
-/// requires, hashes a file to a 64-character digest that a SHA1-only configuration rejects.
-fn parse_tombstoned_digests(
+/// Parses a space-separated digest list under `digest_config`, so a digest names the same blob the
+/// daemon addresses. A backend the daemon talks to in SHA256, which every REAPI server requires,
+/// hashes a file to a 64-character digest that a SHA1-only configuration rejects.
+fn parse_test_digests(
     val: &str,
     digest_config: DigestConfig,
 ) -> buck2_error::Result<HashSet<FileDigest>> {
@@ -666,31 +667,68 @@ fn parse_tombstoned_digests(
         .collect()
 }
 
+/// Parses `configured` into `cell` once, then answers from `cell` for the rest of the daemon's
+/// life. Both variables this serves are fixed at daemon startup, as is `digest_config`, so one
+/// parse holds for every later probe.
+fn cached_test_digests(
+    cell: &'static OnceLock<HashSet<FileDigest>>,
+    configured: Option<&str>,
+    digest_config: DigestConfig,
+) -> buck2_error::Result<&'static HashSet<FileDigest>> {
+    if let Some(digests) = cell.get() {
+        return Ok(digests);
+    }
+
+    let digests = match configured {
+        Some(val) => parse_test_digests(val, digest_config)?,
+        None => HashSet::new(),
+    };
+
+    Ok(cell.get_or_init(|| digests))
+}
+
 /// The digests `BUCK2_TEST_TOMBSTONED_DIGESTS` names, minus whichever of them
 /// [`clear_tombstoned_test_digests`] has since cleared.
-///
-/// The environment variable is fixed for the daemon's lifetime and `digest_config` is decided at
-/// daemon startup, so the parse result is computed once and reused.
 fn configured_tombstoned_digests(
     digest_config: DigestConfig,
 ) -> buck2_error::Result<&'static HashSet<FileDigest>> {
     static TOMBSTONED_DIGESTS: OnceLock<HashSet<FileDigest>> = OnceLock::new();
 
-    if let Some(digests) = TOMBSTONED_DIGESTS.get() {
-        return Ok(digests);
-    }
-
-    let configured = buck2_env!("BUCK2_TEST_TOMBSTONED_DIGESTS", applicability = testing)?;
-    let digests = match configured {
-        Some(val) => parse_tombstoned_digests(val, digest_config)?,
-        None => HashSet::new(),
-    };
-
-    Ok(TOMBSTONED_DIGESTS.get_or_init(|| digests))
+    cached_test_digests(
+        &TOMBSTONED_DIGESTS,
+        buck2_env!("BUCK2_TEST_TOMBSTONED_DIGESTS", applicability = testing)?,
+        digest_config,
+    )
 }
 
+/// The digests `BUCK2_TEST_EVICTED_DIGESTS` names.
+fn configured_evicted_digests(
+    digest_config: DigestConfig,
+) -> buck2_error::Result<&'static HashSet<FileDigest>> {
+    static EVICTED_DIGESTS: OnceLock<HashSet<FileDigest>> = OnceLock::new();
+
+    cached_test_digests(
+        &EVICTED_DIGESTS,
+        buck2_env!("BUCK2_TEST_EVICTED_DIGESTS", applicability = testing)?,
+        digest_config,
+    )
+}
+
+/// The digests `BUCK2_TEST_EVICTED_DIGESTS` names that have already been reported missing.
+///
+/// A real eviction ends when the action that produced the blob runs again and uploads it, so one
+/// of these digests is missing the first time anything asks for it and present from then on.
+/// `BUCK2_TEST_TOMBSTONED_DIGESTS` reports its digests missing for as long as the daemon lives,
+/// which no repair can resolve: a deterministic action re-executes to the identical digest, so
+/// the digest a round repaired is still the digest the next round finds missing. This set models
+/// a chain instead: each digest reports missing once and present after, so a layer resolves as its
+/// own producer re-runs.
+static EVICTED_DIGESTS_REPORTED: LazyLock<BuckDashSet<FileDigest>> =
+    LazyLock::new(BuckDashSet::default);
+
 /// Set once [`clear_tombstoned_test_digests`] runs, after which [`maybe_tombstone_digest`]
-/// treats every digest as present even though `BUCK2_TEST_TOMBSTONED_DIGESTS` still names it.
+/// treats every digest as present even though `BUCK2_TEST_TOMBSTONED_DIGESTS` or
+/// `BUCK2_TEST_EVICTED_DIGESTS` still names it.
 /// The environment variable is fixed for the daemon's lifetime; this is the only way a running
 /// daemon stops treating a digest as missing from the RE CAS.
 static TOMBSTONES_CLEARED: AtomicBool = AtomicBool::new(false);
@@ -710,6 +748,12 @@ fn maybe_tombstone_digest(
     }
 
     if configured_tombstoned_digests(digest_config)?.contains(digest) {
+        return Ok(&*TOMBSTONE_DIGEST);
+    }
+
+    if configured_evicted_digests(digest_config)?.contains(digest)
+        && EVICTED_DIGESTS_REPORTED.insert(digest.dupe())
+    {
         return Ok(&*TOMBSTONE_DIGEST);
     }
 
