@@ -16,6 +16,7 @@ use crate::digest_config::DigestConfig;
 use crate::execute::action_digest::ActionDigest;
 use crate::execute::blobs::ActionBlobs;
 use crate::execute::paths_with_digest::PathsWithDigestBlobData;
+use crate::execute::request::ActionMetadataBlobData;
 
 #[derive(Clone)]
 pub struct ActionDigestAndBlobs {
@@ -28,6 +29,19 @@ pub struct ActionDigestAndBlobs {
 pub struct ActionDigestAndBlobsBuilder {
     digest_config: DigestConfig,
     blobs: ActionBlobs,
+}
+
+impl ActionDigestAndBlobs {
+    /// The encoded bytes of the action itself, recovered from the blobs stored alongside it.
+    ///
+    /// The digest is stored coerced to an action digest, so recovering the blob means undoing that
+    /// coercion; keeping it here spares every caller from re-deriving how the builder keys blobs.
+    pub fn action_blob(&self, digest_config: DigestConfig) -> Option<&ActionMetadataBlobData> {
+        self.blobs.get(&TrackedFileDigest::new(
+            self.action.dupe().coerce(),
+            digest_config.cas_digest_config(),
+        ))
+    }
 }
 
 impl ActionDigestAndBlobsBuilder {
