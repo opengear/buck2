@@ -194,6 +194,11 @@ pub struct DaemonStateData {
     /// final.
     pub cas_missing_recovery_max_command_retries: u32,
 
+    /// The number of repair rounds a single command stages for CAS-missing recovery, beyond the
+    /// one it opens with. One round heals one layer of a dependency chain, so this sets how deep
+    /// an eviction cascade a command works through before its failure is final.
+    pub cas_missing_recovery_max_rounds: u32,
+
     /// Actions whose declared CAS output was reported missing during execution, tracked for the
     /// daemon's lifetime so the next DICE transaction can invalidate them for recovery.
     pub cas_missing_recovery_registry: Arc<CasMissingRecoveryRegistry>,
@@ -713,6 +718,13 @@ impl DaemonState {
                 })?
                 .unwrap_or(1);
 
+            let cas_missing_recovery_max_rounds = root_config
+                .parse::<u32>(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "cas_missing_recovery_max_rounds",
+                })?
+                .unwrap_or(10);
+
             let paranoid = if init_ctx.daemon_startup_config.paranoid {
                 Some(ParanoidDownloader::new(
                     fs.clone(),
@@ -800,6 +812,7 @@ impl DaemonState {
                 cas_missing_recovery_enabled,
                 cas_missing_recovery_max_action_attempts,
                 cas_missing_recovery_max_command_retries,
+                cas_missing_recovery_max_rounds,
                 cas_missing_recovery_registry: Arc::new(CasMissingRecoveryRegistry::new()),
                 http_client,
                 paranoid,

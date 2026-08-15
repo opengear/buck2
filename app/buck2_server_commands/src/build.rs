@@ -14,6 +14,11 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
+use buck2_build_api::actions::cas_missing_recovery::HasCasMissingRecoveryConfig;
+use buck2_build_api::actions::cas_missing_recovery::HasCasMissingRecoveryRegistry;
+use buck2_build_api::actions::cas_missing_recovery::HasCasRecoveryBatch;
+use buck2_build_api::actions::cas_missing_recovery::stage_cas_recovery_round;
+use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
 use buck2_build_api::build;
 use buck2_build_api::build::AsyncBuildTargetResultBuilder;
 use buck2_build_api::build::BuildEvent;
@@ -154,7 +159,7 @@ struct RunArgsMissingSeparator;
 
 async fn build(
     server_ctx: &dyn ServerCommandContextTrait,
-    ctx: DiceTransaction,
+    mut ctx: DiceTransaction,
     request: &buck2_cli_proto::BuildRequest,
 ) -> buck2_error::Result<buck2_cli_proto::BuildResponse> {
     if request.run_args_missing_separator {
@@ -194,37 +199,6 @@ async fn build(
         .any(|p| p.modifiers.as_slice().is_some());
 
     server_ctx.log_target_pattern_with_modifiers(&parsed_patterns_with_modifiers);
-
-    let resolved_pattern: ResolvedPattern<ConfiguredProvidersPatternExtra> =
-        ResolveTargetPatterns::resolve_with_modifiers(
-            &mut ctx.ctx(),
-            &parsed_patterns_with_modifiers,
-        )
-        .await?;
-
-    let target_resolution_config = TargetResolutionConfig::from_args(
-        &mut ctx.ctx(),
-        request
-            .target_cfg
-            .as_ref()
-            .ok_or_else(|| internal_error!("target_cfg must be set"))?,
-        server_ctx,
-        &request.target_universe,
-    )
-    .await?;
-
-    match &target_resolution_config {
-        TargetResolutionConfig::Default(global_cfg_options) => {
-            if !global_cfg_options.cli_modifiers.is_empty() && has_pattern_modifiers {
-                return Err(ModifiersError::PatternModifiersWithGlobalModifiers.into());
-            }
-        }
-        TargetResolutionConfig::Universe(_) => {
-            if has_pattern_modifiers {
-                return Err(ModifiersError::PatternModifiersWithTargetUniverse.into());
-            }
-        }
-    }
 
     let build_providers = Arc::new(request.build_providers.unwrap());
 
@@ -384,55 +358,22 @@ async fn build(
         .map(|s| s.into_build_provider_type())
         .collect();
 
-    let (streaming_build_result_tx, streaming_build_result_rx) =
-        tokio::sync::mpsc::unbounded_channel();
-    // Avoid computing and generating streaming build results if we don't have to
-    let build_command_streaming_build_result_tx = if !build_opts
-        .unstable_streaming_build_report_filename
-        .is_empty()
-    {
-        Some(streaming_build_result_tx)
-    } else {
-        None
-    };
-
-    let return_run_args = request
-        .response_options
-        .as_ref()
-        .is_some_and(|o| o.return_run_args);
     let build_start = Instant::now();
-    let cloned_ctx = ctx.clone(); // build_future does a mutable borrow on the context, so we clone it first
-    let mut dice = ctx.ctx();
-    let build_future = dice.with_linear_recompute(|ctx| {
-        async move {
-            build_targets(
-                ctx,
-                resolved_pattern,
-                target_resolution_config,
-                build_providers,
-                (final_artifact_materializations, final_artifact_uploads).into(),
-                build_opts.fail_fast,
-                MissingTargetBehavior::from_skip(build_opts.skip_missing_targets),
-                build_opts.skip_incompatible_targets,
-                graph_properties.dupe(),
-                return_run_args,
-                timeout_observer.as_ref(),
-                build_command_streaming_build_result_tx,
-                build_start,
-            )
-            .await
-        }
-        .boxed()
-    });
+    let materialization_and_upload =
+        (final_artifact_materializations, final_artifact_uploads).into();
 
-    let build_result = maybe_stream_build_reports(
-        build_future,
-        build_opts,
-        cloned_ctx,
-        graph_properties.dupe(),
+    let build_result = build_until_cas_missing_recovery_converges(
+        &mut ctx,
         server_ctx,
         request,
-        streaming_build_result_rx,
+        build_opts,
+        &parsed_patterns_with_modifiers,
+        has_pattern_modifiers,
+        build_providers,
+        materialization_and_upload,
+        graph_properties.dupe(),
+        timeout_observer.as_ref(),
+        build_start,
     )
     .await?;
 
@@ -606,6 +547,287 @@ async fn init_streaming_build_report(
     initialize_streaming_build_report(build_report_opts, fs, cwd)?;
 
     Ok(())
+}
+
+/// What a finished build round says about the one that should follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CasRecoveryStep {
+    /// Hand the build result back. Either it succeeded, or nothing further can repair it.
+    Finish,
+    /// Hand the build result back, telling the user the round budget ran out first.
+    ReportBudgetSpent,
+    /// Invalidate what the registry has armed and build again.
+    StageAnotherRound,
+}
+
+/// What a finished build round leaves for the next decision.
+struct CasRecoveryRoundResult {
+    /// Whether the build this round ran came back failing.
+    build_failed: bool,
+    /// Whether a CAS-missing failure arms its producing actions at all.
+    recovery_enabled: bool,
+    /// Whether the registry holds any action still under its attempt budget.
+    anything_armed: bool,
+    /// Whether the round finished without any action it staged going on to re-execute.
+    repaired_nothing: bool,
+    /// Whether an armed action sits outside what this round already staged. A failure uncovered
+    /// deeper in the chain shows up here, which is what separates a build that has more to repair
+    /// from one that is spinning on actions it does not depend on.
+    armed_beyond_staged: bool,
+    /// How many further rounds the command may stage.
+    rounds_left: u32,
+}
+
+/// Decides whether a command repairs again after a round.
+///
+/// Repairing again is worth doing only while the build is failing, the registry has something left
+/// it will repair, and either the last round accomplished something or the failure uncovered an
+/// action no round has staged yet. A round that staged actions and repaired none of them, with
+/// nothing newly armed, would stage the same actions to the same effect.
+fn next_cas_recovery_step(round: CasRecoveryRoundResult) -> CasRecoveryStep {
+    if !round.build_failed || !round.recovery_enabled || !round.anything_armed {
+        return CasRecoveryStep::Finish;
+    }
+
+    if round.repaired_nothing && !round.armed_beyond_staged {
+        return CasRecoveryStep::Finish;
+    }
+
+    if round.rounds_left == 0 {
+        return CasRecoveryStep::ReportBudgetSpent;
+    }
+
+    CasRecoveryStep::StageAnotherRound
+}
+
+/// Builds the requested targets, repairing CAS-missing failures until the build stops reporting
+/// them.
+///
+/// An action that fails because an input digest has gone from the RE CAS arms the action that
+/// produced that digest. Repairing it takes a new DICE transaction, because invalidating a key
+/// that DICE has already computed is only possible between transactions, and one such transaction
+/// only reaches one layer of a dependency chain: an evicted output deeper in the chain stays
+/// hidden behind the failure above it, since nothing requested it while that failure stood. Each
+/// round therefore uncovers the next layer, and `ctx` advances to the transaction the next round
+/// runs in.
+///
+/// Rounds stop as soon as the build succeeds, and otherwise when the registry has nothing armed
+/// left to repair, when a round stages actions the build then never requests, or when the round
+/// budget runs out. `ctx` is left holding the transaction the returned result came from, so the
+/// metrics, sketches and build report the caller derives from it describe the build the user
+/// ended up with.
+async fn build_until_cas_missing_recovery_converges(
+    ctx: &mut DiceTransaction,
+    server_ctx: &dyn ServerCommandContextTrait,
+    request: &buck2_cli_proto::BuildRequest,
+    build_opts: &CommonBuildOptions,
+    parsed_patterns_with_modifiers: &[ParsedPatternWithModifiers<
+        ConfiguredProvidersPatternExtra,
+    >],
+    has_pattern_modifiers: bool,
+    build_providers: Arc<BuildProviders>,
+    materialization_and_upload: MaterializationAndUploadContext,
+    graph_properties: GraphPropertiesOptions,
+    timeout_observer: Option<&Arc<dyn LivelinessObserver>>,
+    build_start: Instant,
+) -> buck2_error::Result<BuildTargetResult> {
+    let recovery = ctx.per_transaction_data().get_cas_missing_recovery_config();
+    let recovery_enabled = ctx
+        .per_transaction_data()
+        .get_run_action_knobs()
+        .cas_missing_recovery_enabled;
+    let registry = ctx
+        .per_transaction_data()
+        .get_cas_missing_recovery_registry();
+    // The batch outlives each transaction so that restaging it reaches the executor layer of the
+    // round that follows, which reads the same object out of the user data DICE carries forward.
+    let batch = ctx.per_transaction_data().get_cas_recovery_batch();
+    let mut rounds_left = recovery.max_rounds;
+
+    loop {
+        let staged = batch.staged();
+        let repairs_before = batch.repairs_charged();
+
+        let result = run_build_round(
+            ctx,
+            server_ctx,
+            request,
+            build_opts,
+            parsed_patterns_with_modifiers,
+            has_pattern_modifiers,
+            build_providers.dupe(),
+            materialization_and_upload,
+            graph_properties.dupe(),
+            timeout_observer,
+            build_start,
+        )
+        .await?;
+
+        let armed = registry.keys_eligible_for_recovery(recovery.max_action_attempts);
+        let step = next_cas_recovery_step(CasRecoveryRoundResult {
+            build_failed: result.build_failed,
+            recovery_enabled,
+            anything_armed: !armed.is_empty(),
+            repaired_nothing: batch.repairs_charged() == repairs_before,
+            armed_beyond_staged: armed.iter().any(|key| !staged.contains(key)),
+            rounds_left,
+        });
+
+        match step {
+            CasRecoveryStep::Finish => return Ok(result),
+            CasRecoveryStep::ReportBudgetSpent => {
+                console_message(format!(
+                    "Stopping after {} repair round(s) for artifacts that expired in the RE CAS. \
+                     Set `buck2.cas_missing_recovery_max_rounds` higher to work through a deeper \
+                     chain.",
+                    recovery.max_rounds
+                ));
+                return Ok(result);
+            }
+            CasRecoveryStep::StageAnotherRound => {}
+        }
+
+        // A round commits its own DICE version rather than going through the concurrency handler
+        // the command entered on. Another command holding an older transaction keeps computing
+        // against the version it entered on, so what it sees stays internally consistent; the
+        // handler negotiates which version a command starts at, which is settled for this one.
+        let mut updater = ctx.dupe().into_updater();
+        let staged_now = match stage_cas_recovery_round(
+            &registry,
+            recovery.max_action_attempts,
+            &batch,
+            &mut updater,
+        ) {
+            Ok(staged_now) => staged_now,
+            Err(e) => {
+                // Every later round would fail to invalidate for the same reason, so saying this
+                // once beats repeating a promise to re-run actions that stay as they are.
+                console_message(format!(
+                    "Cannot re-run the actions whose output expired in the RE CAS: {e}"
+                ));
+                return Ok(result);
+            }
+        };
+
+        // The registry has nothing left it is willing to repair: every action it tracks has been
+        // repaired already or has spent its attempt budget.
+        if staged_now == 0 {
+            return Ok(result);
+        }
+
+        *ctx = updater.commit().await;
+        console_message(format!(
+            "Re-running {} whose output expired in the RE CAS, then rebuilding everything that \
+             depends on {}.",
+            if staged_now == 1 {
+                "1 action".to_owned()
+            } else {
+                format!("{staged_now} actions")
+            },
+            if staged_now == 1 { "it" } else { "them" }
+        ));
+        rounds_left -= 1;
+    }
+}
+
+/// Builds the requested targets once against `ctx`.
+///
+/// Resolving the target patterns is part of the round because the build consumes the resolved
+/// pattern and the target resolution config, and CAS-missing recovery runs rounds against a
+/// succession of transactions. Both resolve out of DICE's cache from the second round on.
+async fn run_build_round(
+    ctx: &mut DiceTransaction,
+    server_ctx: &dyn ServerCommandContextTrait,
+    request: &buck2_cli_proto::BuildRequest,
+    build_opts: &CommonBuildOptions,
+    parsed_patterns_with_modifiers: &[ParsedPatternWithModifiers<
+        ConfiguredProvidersPatternExtra,
+    >],
+    has_pattern_modifiers: bool,
+    build_providers: Arc<BuildProviders>,
+    materialization_and_upload: MaterializationAndUploadContext,
+    graph_properties: GraphPropertiesOptions,
+    timeout_observer: Option<&Arc<dyn LivelinessObserver>>,
+    build_start: Instant,
+) -> buck2_error::Result<BuildTargetResult> {
+    let resolved_pattern: ResolvedPattern<ConfiguredProvidersPatternExtra> =
+        ResolveTargetPatterns::resolve_with_modifiers(&mut ctx.ctx(), parsed_patterns_with_modifiers)
+            .await?;
+
+    let target_resolution_config = TargetResolutionConfig::from_args(
+        &mut ctx.ctx(),
+        request
+            .target_cfg
+            .as_ref()
+            .ok_or_else(|| internal_error!("target_cfg must be set"))?,
+        server_ctx,
+        &request.target_universe,
+    )
+    .await?;
+
+    match &target_resolution_config {
+        TargetResolutionConfig::Default(global_cfg_options) => {
+            if !global_cfg_options.cli_modifiers.is_empty() && has_pattern_modifiers {
+                return Err(ModifiersError::PatternModifiersWithGlobalModifiers.into());
+            }
+        }
+        TargetResolutionConfig::Universe(_) => {
+            if has_pattern_modifiers {
+                return Err(ModifiersError::PatternModifiersWithTargetUniverse.into());
+            }
+        }
+    }
+
+    let (streaming_build_result_tx, streaming_build_result_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    // Avoid computing and generating streaming build results if we don't have to
+    let build_command_streaming_build_result_tx = if !build_opts
+        .unstable_streaming_build_report_filename
+        .is_empty()
+    {
+        Some(streaming_build_result_tx)
+    } else {
+        None
+    };
+
+    let return_run_args = request
+        .response_options
+        .as_ref()
+        .is_some_and(|o| o.return_run_args);
+    let cloned_ctx = ctx.dupe(); // build_future does a mutable borrow on the context, so we clone it first
+    let mut dice = ctx.ctx();
+    let build_future = dice.with_linear_recompute(|ctx| {
+        async move {
+            build_targets(
+                ctx,
+                resolved_pattern,
+                target_resolution_config,
+                build_providers,
+                materialization_and_upload,
+                build_opts.fail_fast,
+                MissingTargetBehavior::from_skip(build_opts.skip_missing_targets),
+                build_opts.skip_incompatible_targets,
+                graph_properties.dupe(),
+                return_run_args,
+                timeout_observer,
+                build_command_streaming_build_result_tx,
+                build_start,
+            )
+            .await
+        }
+        .boxed()
+    });
+
+    maybe_stream_build_reports(
+        build_future,
+        build_opts,
+        cloned_ctx,
+        graph_properties,
+        server_ctx,
+        request,
+        streaming_build_result_rx,
+    )
+    .await
 }
 
 async fn maybe_stream_build_reports(
@@ -1137,5 +1359,124 @@ impl std::str::FromStr for SkipProvider {
             "test" => Ok(SkipProvider::Test),
             other => Err(SkipProviderParseError(other.to_owned())),
         }
+    }
+}
+
+#[cfg(test)]
+mod cas_recovery_step_tests {
+    use super::CasRecoveryRoundResult;
+    use super::CasRecoveryStep;
+    use super::next_cas_recovery_step;
+
+    /// A round that failed with one action armed, none of it staged yet, and budget to spare —
+    /// the shape every case below varies one field of.
+    fn repairable_round() -> CasRecoveryRoundResult {
+        CasRecoveryRoundResult {
+            build_failed: true,
+            recovery_enabled: true,
+            anything_armed: true,
+            repaired_nothing: false,
+            armed_beyond_staged: true,
+            rounds_left: 1,
+        }
+    }
+
+    #[test]
+    fn a_repairable_round_stages_another() {
+        assert_eq!(
+            next_cas_recovery_step(repairable_round()),
+            CasRecoveryStep::StageAnotherRound
+        );
+    }
+
+    #[test]
+    fn a_build_that_succeeded_finishes() {
+        // Repairing exists to rescue a failing build. A succeeding one is done no matter what the
+        // registry still holds, which it can hold from an earlier command.
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                build_failed: false,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::Finish
+        );
+    }
+
+    #[test]
+    fn a_build_with_recovery_disabled_finishes() {
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                recovery_enabled: false,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::Finish
+        );
+    }
+
+    #[test]
+    fn a_quiet_registry_finishes() {
+        // Every action the registry tracks has been repaired or has spent its attempt budget, so
+        // the failure that remains is one no round can act on.
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                anything_armed: false,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::Finish
+        );
+    }
+
+    #[test]
+    fn a_round_that_repaired_nothing_new_finishes() {
+        // The staged actions never re-executed and nothing else armed, so the build does not
+        // depend on them and the next round would select the same actions to the same effect.
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                repaired_nothing: true,
+                armed_beyond_staged: false,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::Finish
+        );
+    }
+
+    #[test]
+    fn a_round_that_repaired_nothing_still_stages_for_a_newly_armed_action() {
+        // A previous command can leave an action armed that this build never requests. Staging it
+        // charges nothing, and treating that as the end would abandon a failure uncovered deeper
+        // in the chain that one more round would repair.
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                repaired_nothing: true,
+                armed_beyond_staged: true,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::StageAnotherRound
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_is_reported_rather_than_staged() {
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                rounds_left: 0,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::ReportBudgetSpent
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_on_a_failure_recovery_cannot_act_on_stays_silent() {
+        // The budget message names the RE CAS, so a failure with nothing armed — an ordinary
+        // compile error, say — has to finish quietly rather than blame an eviction.
+        assert_eq!(
+            next_cas_recovery_step(CasRecoveryRoundResult {
+                anything_armed: false,
+                rounds_left: 0,
+                ..repairable_round()
+            }),
+            CasRecoveryStep::Finish
+        );
     }
 }

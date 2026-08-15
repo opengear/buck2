@@ -51,6 +51,7 @@ use crate::key::DiceKey;
 use crate::key::ParentKey;
 use crate::opaque::OpaqueValue;
 use crate::updater::ActiveTransactionGuard;
+use crate::updater::TransactionUpdater;
 use crate::user_cycle::KeyComputingUserCycleDetectorData;
 use crate::value::DiceComputedValue;
 use crate::value::TrackedInvalidationPaths;
@@ -126,6 +127,13 @@ impl TransactionCtx {
             // context of a `DiceTransaction` we don't actually need the data
             dep_trackers: RecordingDepsTracker::new(TrackedInvalidationPaths::clean()),
         }
+    }
+
+    pub(crate) fn into_updater(self) -> TransactionUpdater {
+        TransactionUpdater::new(
+            self.ctx.transaction_data.dice.dupe(),
+            self.ctx.transaction_data.user_data.dupe(),
+        )
     }
 }
 

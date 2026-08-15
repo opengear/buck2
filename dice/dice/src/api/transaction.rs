@@ -103,6 +103,13 @@ impl DiceTransaction {
         DiceEquality(self.0.get_version())
     }
 
+    /// Creates an Updater to record changes to DICE that upon committing, creates a new transaction
+    /// that keeps the same set of user data. This is equivalent to `Dice::updater_with_data(data)`
+    /// where the `data` is taken from the current Transaction.
+    pub fn into_updater(self) -> DiceTransactionUpdater {
+        DiceTransactionUpdater(self.0.into_updater())
+    }
+
     /// Request the result of computing a particular key.
     ///
     /// This is similar to `DiceComputations::compute`, but a bit more flexible as it takes `&self`

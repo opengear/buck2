@@ -3,3 +3,11 @@ load(":defs.bzl", "cp")
 cp(name = "stage0", src = "src")
 cp(name = "stage1", src = ":stage0")
 cp(name = "stage2", src = ":stage1", local_only = True)
+
+# A dependency chain with a distinct output digest at every level. :chain_low and :chain_top are
+# the levels that read another level's output off the local disk, so making the blob behind that
+# output disappear fails them.
+cp(name = "chain_deep", src = "chain_deep_src")
+cp(name = "chain_low", src = "chain_low_src", dep = ":chain_deep", local_only = True)
+cp(name = "chain_high", src = "chain_high_src", dep = ":chain_low")
+cp(name = "chain_top", src = "chain_top_src", dep = ":chain_high", local_only = True)

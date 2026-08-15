@@ -57,7 +57,6 @@ use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::DiceTrackedInvalidationPath;
-use dice::DiceTransactionUpdater;
 use dice::Key;
 use dice::OkPagableValueSerialize;
 use dice::ValueSerialize;
@@ -665,9 +664,9 @@ fn index_artifact_value_digests(
 }
 
 /// The guidance shown to the user when CAS-missing recovery identified at least one producing
-/// action and armed it for re-execution on the next build.
+/// action and armed it for re-execution.
 const CAS_MISSING_RECOVERY_QUEUED: &str = "Buck2 identified the action(s) that produced these \
-    artifacts and queued them for re-execution on your next build.";
+    artifacts and queued them for re-execution.";
 
 /// The guidance shown to the user when CAS-missing recovery could not identify a producing action
 /// for any of the missing digests, so the failure is fatal and the daemon's in-memory state is
@@ -845,8 +844,8 @@ fn charge_cas_missing_recovery_repair(
     batch: &CasRecoveryBatch,
     key: &ActionKey,
 ) {
-    if batch.contains(key) {
-        registry.record_repair_attempt(key);
+    if batch.contains(key) && registry.record_repair_attempt(key) {
+        batch.record_repair_charged();
     }
 }
 
@@ -1081,17 +1080,6 @@ impl Key for BuildKey {
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         OkPagableValueSerialize::<Self::Value>::new()
     }
-}
-
-/// Invalidates `keys` in `ctx`, so the next computation of each one re-executes instead of
-/// returning DICE's cached result.
-pub fn invalidate_actions_for_recovery(
-    keys: &[ActionKey],
-    ctx: &mut DiceTransactionUpdater,
-) -> buck2_error::Result<()> {
-    let build_keys: Vec<BuildKey> = keys.iter().map(|key| BuildKey(key.dupe())).collect();
-    ctx.changed(build_keys)?;
-    Ok(())
 }
 
 async fn command_execution_report_to_proto(
@@ -1518,9 +1506,12 @@ mod cas_missing_recovery_tests {
         let (_, armed_elsewhere) = build_artifact("armed_elsewhere", 1);
         registry.record_missing(in_batch.dupe());
         registry.record_missing(armed_elsewhere.dupe());
-        let batch = CasRecoveryBatch::new(HashSet::from([in_batch.dupe()]));
+        let batch = CasRecoveryBatch::empty();
+        batch.replace([in_batch.dupe()]);
 
         charge_cas_missing_recovery_repair(&registry, &batch, &armed_elsewhere);
+
+        assert_eq!(batch.repairs_charged(), 0);
 
         let still_eligible: HashSet<ActionKey> =
             registry.keys_eligible_for_recovery(1).into_iter().collect();
@@ -1535,10 +1526,14 @@ mod cas_missing_recovery_tests {
         let registry = CasMissingRecoveryRegistry::new();
         let (_, in_batch) = build_artifact("selected", 0);
         registry.record_missing(in_batch.dupe());
-        let batch = CasRecoveryBatch::new(HashSet::from([in_batch.dupe()]));
+        let batch = CasRecoveryBatch::empty();
+        batch.replace([in_batch.dupe()]);
 
         charge_cas_missing_recovery_repair(&registry, &batch, &in_batch);
 
+        // The loop reads this count to tell a round that made progress from one that made none,
+        // so the charge has to reach the batch and not only the registry.
+        assert_eq!(batch.repairs_charged(), 1);
         assert_eq!(
             registry.keys_eligible_for_recovery(1),
             Vec::<ActionKey>::new()
@@ -1556,6 +1551,7 @@ mod cas_missing_recovery_tests {
 
         charge_cas_missing_recovery_repair(&registry, &batch, &key);
 
+        assert_eq!(batch.repairs_charged(), 0);
         assert_eq!(registry.keys_eligible_for_recovery(1), vec![key]);
     }
 

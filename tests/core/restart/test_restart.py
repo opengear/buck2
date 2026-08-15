@@ -22,6 +22,11 @@ from buck2.tests.e2e_util.helper.utils import read_invocation_record
 
 TEST_DIGEST = "76f7aea8c1fc400287312b9608ceb24848ba02ac:14"
 
+# The output digests of //:chain_deep and //:chain_high, which copy chain_deep_src and
+# chain_high_src unchanged.
+CHAIN_DEEP_DIGEST = "5ca5433e0d1259866e5bd69375f792d27b89d797:11"
+CHAIN_HIGH_DIGEST = "6add14ad478cdca506b0abfddd741dfd3ed2de37:11"
+
 
 @buck_test()
 async def test_restart_requires_no_stdout(buck: Buck) -> None:
@@ -160,13 +165,21 @@ async def _daemon_pid(buck: Buck) -> int:
     return status["process_info"]["pid"]
 
 
-def _enable_cas_missing_recovery(buck: Buck, max_command_retries: int = 1) -> None:
+def _enable_cas_missing_recovery(
+    buck: Buck,
+    max_command_retries: int = 1,
+    max_rounds: int | None = None,
+    restarter: bool = True,
+) -> None:
+    settings = [
+        "cas_missing_recovery = true",
+        f"cas_missing_recovery_max_command_retries = {max_command_retries}",
+        f"restarter = {str(restarter).lower()}",
+    ]
+    if max_rounds is not None:
+        settings.append(f"cas_missing_recovery_max_rounds = {max_rounds}")
     with open(buck.cwd / ".buckconfig", "a") as f:
-        f.write(
-            "[buck2]\n"
-            "cas_missing_recovery = true\n"
-            f"cas_missing_recovery_max_command_retries = {max_command_retries}\n"
-        )
+        f.write("[buck2]\n" + "".join(f"{s}\n" for s in settings))
 
 
 @buck_test(allow_soft_errors=True)
@@ -203,38 +216,29 @@ async def test_cas_missing_recovery_repairs_without_a_new_daemon(buck: Buck) -> 
 
 
 @buck_test(allow_soft_errors=True)
-async def test_cas_missing_recovery_retries_automatically_within_one_invocation(
+async def test_cas_missing_recovery_repairs_within_one_invocation(
     buck: Buck, tmp_path: Path
 ) -> None:
     await buck.kill()
 
-    # A generous retry budget gives the concurrent clear below several chances to land between
-    # two attempts, without depending on exactly which attempt it beats.
-    _enable_cas_missing_recovery(buck, max_command_retries=5)
+    # Neither the client retry nor the daemon restarter can run a second command, so a build that
+    # succeeds did its repair inside the single command the user asked for.
+    _enable_cas_missing_recovery(buck, max_command_retries=0, restarter=False)
 
-    await buck.build(env={"BUCK2_TEST_TOMBSTONED_DIGESTS": TEST_DIGEST})
+    await buck.build(env={"BUCK2_TEST_EVICTED_DIGESTS": CHAIN_DEEP_DIGEST})
     daemon_pid = await _daemon_pid(buck)
 
     record_file = tmp_path / "record.json"
-    build = buck.build(
-        "//:stage2",
+    res = await buck.build(
+        "//:chain_low",
         "--unstable-write-invocation-record",
         str(record_file),
     )
 
-    async def clear_tombstone_mid_build() -> None:
-        # The retry runs in-process against the already-running daemon, so it follows the
-        # first failure almost immediately; this delay only needs to clear the tombstone after
-        # the first attempt has had time to fail, not before.
-        await asyncio.sleep(3)
-        await buck.audit("deferred-materializer", "clear-tombstoned-test-digests")
-
-    _, res = await asyncio.gather(clear_tombstone_mid_build(), build)
-
-    assert res.get_build_report().output_for_target("//:stage2").exists()
+    assert res.get_build_report().output_for_target("//:chain_low").exists()
 
     record = read_invocation_record(record_file)
-    assert record["restarted_trace_id"] is not None
+    assert record["restarted_trace_id"] is None
 
     assert await _daemon_pid(buck) == daemon_pid
 
@@ -252,6 +256,63 @@ async def test_cas_missing_recovery_command_retry_is_bounded(buck: Buck) -> None
         buck.build("//:stage2", env={"BUCK2_TEST_TOMBSTONED_DIGESTS": TEST_DIGEST})
     )
     assert res.stderr.count("Your command will now restart") == 1
+
+
+@buck_test(allow_soft_errors=True)
+async def test_cas_missing_recovery_works_through_a_cascade_of_evictions(
+    buck: Buck,
+) -> None:
+    await buck.kill()
+
+    # Neither the client retry nor the daemon restarter can run a second command, so healing both
+    # layers has to happen in rounds inside the one command. Left enabled, a daemon that healed a
+    # single layer per command would pass this by letting the retry cover the other layer.
+    _enable_cas_missing_recovery(buck, max_command_retries=0, restarter=False)
+
+    # //:chain_deep -> //:chain_low -> //:chain_high -> //:chain_top, with the outputs of
+    # //:chain_deep and //:chain_high gone from the CAS. Only //:chain_low can see its own
+    # eviction to begin with: //:chain_top sits behind //:chain_low's failure, so nothing has
+    # asked for //:chain_high's output yet and the second eviction is still invisible. Repairing
+    # //:chain_deep lets //:chain_high run, and //:chain_top then reaches the second eviction,
+    # which takes a further repair. A daemon that healed one layer per command would leave this
+    # build failing on the layer it had not reached yet.
+    # The daemon reads the injected digests once and holds them for its lifetime, so this build
+    # starts it under the same injection rather than an empty one. It names no targets, which
+    # leaves both digests still unasked-for.
+    evicted = {"BUCK2_TEST_EVICTED_DIGESTS": f"{CHAIN_DEEP_DIGEST} {CHAIN_HIGH_DIGEST}"}
+    await buck.build(env=evicted)
+    daemon_pid = await _daemon_pid(buck)
+
+    res = await buck.build("//:chain_top", env=evicted)
+
+    assert res.get_build_report().output_for_target("//:chain_top").exists()
+    assert res.stderr.count("whose output expired in the RE CAS") == 2
+    assert "Your command will now restart" not in res.stderr
+    assert await _daemon_pid(buck) == daemon_pid
+
+
+@buck_test(allow_soft_errors=True)
+async def test_cas_missing_recovery_rounds_are_bounded(buck: Buck) -> None:
+    await buck.kill()
+
+    # Neither the client retry nor the daemon restarter runs a second command, so every repair
+    # round this counts belongs to the one command it measures. One round is fewer than the two
+    # attempts an action gets, which leaves the round budget as the bound that stops this build
+    # rather than the per-action one.
+    _enable_cas_missing_recovery(
+        buck, max_command_retries=0, max_rounds=1, restarter=False
+    )
+
+    # BUCK2_TEST_TOMBSTONED_DIGESTS keeps a digest missing for as long as the daemon lives, so a
+    # repair reproduces a digest that is still gone and arms the action again. Rounds would go on
+    # for as long as the build keeps failing; the round budget stops them.
+    res = await expect_failure(
+        buck.build("//:stage2", env={"BUCK2_TEST_TOMBSTONED_DIGESTS": TEST_DIGEST})
+    )
+    assert res.stderr.count("whose output expired in the RE CAS") == 1
+    # The user is told when the budget runs out, so a build that stops short of repairing says
+    # so rather than leaving the underlying failure look like recovery was never attempted.
+    assert "Stopping after 1 repair round(s)" in res.stderr
 
 
 @buck_test()

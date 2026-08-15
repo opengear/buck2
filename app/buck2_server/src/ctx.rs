@@ -17,10 +17,12 @@ use std::time::Instant;
 
 use allocative::Allocative;
 use async_trait::async_trait;
-use buck2_build_api::actions::calculation::invalidate_actions_for_recovery;
+use buck2_build_api::actions::cas_missing_recovery::CasMissingRecoveryConfig;
 use buck2_build_api::actions::cas_missing_recovery::CasRecoveryBatch;
+use buck2_build_api::actions::cas_missing_recovery::SetCasMissingRecoveryConfig;
 use buck2_build_api::actions::cas_missing_recovery::SetCasMissingRecoveryRegistry;
 use buck2_build_api::actions::cas_missing_recovery::SetCasRecoveryBatch;
+use buck2_build_api::actions::cas_missing_recovery::stage_cas_recovery_round;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
@@ -133,8 +135,6 @@ use dupe::Dupe;
 use gazebo::prelude::SliceExt;
 use host_sharing::HostSharingBroker;
 use host_sharing::HostSharingStrategy;
-use itertools::Itertools;
-use tracing::info;
 use tracing::warn;
 
 use crate::active_commands::ActiveCommandDropGuard;
@@ -732,59 +732,53 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
                 .dupe(),
         );
         user_data.set_cas_recovery_batch(cas_recovery_batch);
+        user_data.set_cas_missing_recovery_config(self.cas_missing_recovery_config());
 
         Ok((ctx, user_data))
     }
 }
 
 impl DiceCommandUpdater<'_, '_> {
-    /// Selects the actions the CAS-missing recovery registry has armed for this transaction,
-    /// invalidates them so they recompute instead of returning DICE's cached failure, and returns
-    /// the batch so the executor layer can route those actions around cached results that would
-    /// hand back the digest that was reported missing. The registry itself is untouched here: an
-    /// action is charged against its attempt budget only once the executor layer confirms it
-    /// actually re-executed.
+    /// Builds the recovery batch this command starts with, staging the actions a previous command
+    /// armed and left unrepaired.
+    ///
+    /// The batch outlives this transaction: the build command reuses the same object for every
+    /// repair round it runs, restaging it against a fresh transaction each time.
     ///
     /// The registry only gains entries through `CasMissingRecoveryRegistry::record_missing`,
     /// which the build layer calls only when recovery is enabled, so a disabled build keeps the
-    /// registry empty and this returns an empty batch after the config check alone. Invalidation
-    /// failure also returns an empty batch, so the batch handed to the executor layer never
-    /// claims an action was invalidated when it was not.
+    /// registry empty and this returns an empty batch after the config check alone.
     fn stage_cas_missing_recovery_batch(
         &self,
         ctx: &mut DiceTransactionUpdater,
     ) -> CasRecoveryBatch {
-        if !self.cas_missing_recovery_enabled {
-            return CasRecoveryBatch::empty();
+        let batch = CasRecoveryBatch::empty();
+
+        if self.cas_missing_recovery_enabled {
+            let daemon = &self.cmd_ctx.base_context.daemon;
+            if let Err(e) = stage_cas_recovery_round(
+                &daemon.cas_missing_recovery_registry,
+                daemon.cas_missing_recovery_max_action_attempts,
+                &batch,
+                ctx,
+            ) {
+                // A repair a previous command left armed cannot be staged, which leaves this
+                // command building against the digest that went missing. That failure belongs to
+                // the build about to run, so this command starts on an empty batch and reports it
+                // through the round it reaches rather than refusing to start.
+                warn!(error = %e, "staging the opening CAS-missing recovery round");
+            }
         }
 
+        batch
+    }
+
+    fn cas_missing_recovery_config(&self) -> CasMissingRecoveryConfig {
         let daemon = &self.cmd_ctx.base_context.daemon;
-        let keys = daemon
-            .cas_missing_recovery_registry
-            .keys_eligible_for_recovery(daemon.cas_missing_recovery_max_action_attempts);
-        if keys.is_empty() {
-            return CasRecoveryBatch::empty();
+        CasMissingRecoveryConfig {
+            max_action_attempts: daemon.cas_missing_recovery_max_action_attempts,
+            max_rounds: daemon.cas_missing_recovery_max_rounds,
         }
-
-        let actions = keys.iter().map(|key| key.to_string()).join(", ");
-
-        if let Err(e) = invalidate_actions_for_recovery(&keys, ctx) {
-            warn!(
-                error = %e,
-                action_count = keys.len(),
-                actions = %actions,
-                "invalidating actions for CAS-missing recovery"
-            );
-            return CasRecoveryBatch::empty();
-        }
-
-        info!(
-            action_count = keys.len(),
-            actions = %actions,
-            "invalidated actions for CAS-missing recovery"
-        );
-
-        CasRecoveryBatch::new(keys.into_iter().collect())
     }
 
     fn make_user_computation_data(
