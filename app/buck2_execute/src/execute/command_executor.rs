@@ -269,6 +269,19 @@ impl CommandExecutor {
     }
 }
 
+/// Orders `platform`'s properties by name and then by value, as REv2 requires of an action's
+/// platform.
+///
+/// A scheduler matches an action to a worker pool by comparing the whole property set, so an
+/// out-of-order list matches no pool. The configured platform arrives already ordered from its
+/// source map; appending a `persistentWorkerKey` is what puts it out of order.
+fn sorted_platform(mut platform: RE::Platform) -> RE::Platform {
+    platform
+        .properties
+        .sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
+    platform
+}
+
 fn re_create_action(
     args: Vec<String>,
     all_args: Vec<String>,
@@ -291,6 +304,8 @@ fn re_create_action(
     re_outputs_required: bool,
     allow_unsandboxed_action_cache_uploads: bool,
 ) -> buck2_error::Result<PreparedAction> {
+    let platform = sorted_platform(platform);
+
     let (worker_tool_init_action, command_args) = if let Some(worker) = worker {
         let mut action_and_blobs = ActionDigestAndBlobsBuilder::new(digest_config);
         let command = RE::Command {
@@ -319,6 +334,10 @@ fn re_create_action(
                 .transpose()
                 .buck_error_context("Cannot convert timeout to GRPC")?,
             do_not_cache,
+            // A scheduler reads the platform from the action, from the command, or from both, so
+            // both name it and a scheduler of either kind matches the same pool.
+            #[cfg(not(fbcode_build))]
+            platform: Some(platform.clone()),
             ..Default::default()
         };
         #[cfg(fbcode_build)]
@@ -332,7 +351,7 @@ fn re_create_action(
     let mut command = RE::Command {
         arguments: command_args,
         #[allow(deprecated)]
-        platform: Some(platform),
+        platform: Some(platform.clone()),
         working_directory: working_directory.as_str().to_owned(),
         environment_variables: environment
             .iter()
@@ -402,6 +421,8 @@ fn re_create_action(
             .transpose()
             .buck_error_context("Cannot convert timeout to GRPC")?,
         do_not_cache,
+        #[cfg(not(fbcode_build))]
+        platform: Some(platform),
         #[cfg(fbcode_build)]
         allow_unsandboxed_action_cache_uploads,
         #[cfg(fbcode_build)]
@@ -507,4 +528,170 @@ fn set_action_network_access(
         ExecutorNetworkAccess::Loopback => RE::NetworkIsolationType::Loopback,
         ExecutorNetworkAccess::Private => RE::NetworkIsolationType::Private,
     } as i32;
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod tests {
+    use buck2_common::file_ops::metadata::FileDigest;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use prost::Message;
+
+    use super::*;
+    use crate::digest::CasDigestFromReExt;
+
+    fn prop(name: &str, value: &str) -> RE::Property {
+        RE::Property {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn platform_of(pairs: &[(&str, &str)]) -> RE::Platform {
+        RE::Platform {
+            properties: pairs.iter().map(|(n, v)| prop(n, v)).collect(),
+        }
+    }
+
+    fn names_and_values(platform: &RE::Platform) -> Vec<(String, String)> {
+        platform
+            .properties
+            .iter()
+            .map(|p| (p.name.clone(), p.value.clone()))
+            .collect()
+    }
+
+    /// Builds an action the way `prepare_action` does for a request with no worker, then decodes
+    /// the bytes `re_create_action` encoded. Decoding those bytes, rather than reading the struct
+    /// literal that produced them, means a field dropped from that literal fails the assertions.
+    fn encoded_action(platform: RE::Platform) -> (RE::Action, PreparedAction) {
+        let digest_config = DigestConfig::testing_default();
+        let prepared = re_create_action(
+            vec!["ignored".to_owned()],
+            vec!["ignored".to_owned()],
+            &[],
+            ProjectRelativePath::empty(),
+            &SortedVectorMap::new(),
+            &TrackedFileDigest::empty(digest_config.cas_digest_config()),
+            None,
+            platform,
+            false,
+            digest_config,
+            OutputPathsBehavior::Compatibility,
+            None,
+            false,
+            &Vec::new(),
+            &Vec::new(),
+            &None,
+            &[],
+            &None,
+            false,
+            false,
+        )
+        .expect("building an action with no outputs and no worker cannot fail");
+
+        let blob = prepared
+            .action_and_blobs
+            .action_blob(digest_config)
+            .expect("the builder stores the action it just encoded");
+        let action =
+            RE::Action::decode(blob.0.as_slice()).expect("the stored blob is an encoded action");
+        (action, prepared)
+    }
+
+    #[test]
+    fn an_encoded_action_names_its_platform() {
+        // A scheduler that reads only `Action.platform` matches no worker pool when the field is
+        // absent, and leaves the action queued until it times out.
+        let (action, _) = encoded_action(platform_of(&[("OSFamily", "linux")]));
+
+        assert_eq!(
+            names_and_values(&action.platform.expect("the action names a platform")),
+            vec![("OSFamily".to_owned(), "linux".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_encoded_action_and_its_command_name_the_same_platform() {
+        // Schedulers differ in which message they read the platform from. Naming the same set in
+        // both means either kind of scheduler picks the same pool. Both sets are decoded, because
+        // the two assignments are separate lines that a change can move apart.
+        let platform = platform_of(&[("container-image", "docker://img"), ("OSFamily", "linux")]);
+        let (action, prepared) = encoded_action(platform);
+        let digest_config = DigestConfig::testing_default();
+
+        let command_digest = action
+            .command_digest
+            .clone()
+            .expect("the action names its command");
+        let command_blob = prepared
+            .action_and_blobs
+            .blobs
+            .get(&TrackedFileDigest::new(
+                FileDigest::from_grpc(&command_digest, digest_config)
+                    .expect("the command digest the action names is well formed"),
+                digest_config.cas_digest_config(),
+            ))
+            .expect("the builder stores the command it just encoded");
+        let command = RE::Command::decode(command_blob.0.as_slice())
+            .expect("the stored blob is an encoded command");
+
+        let expected = vec![
+            ("OSFamily".to_owned(), "linux".to_owned()),
+            ("container-image".to_owned(), "docker://img".to_owned()),
+        ];
+        assert_eq!(
+            names_and_values(&action.platform.expect("the action names a platform")),
+            expected
+        );
+        #[allow(deprecated)]
+        let command_platform = command.platform.expect("the command names a platform");
+        assert_eq!(names_and_values(&command_platform), expected);
+    }
+
+    #[test]
+    fn sorting_orders_properties_by_name_then_value() {
+        let sorted = sorted_platform(platform_of(&[("b", "2"), ("a", "2"), ("a", "1")]));
+
+        assert_eq!(
+            names_and_values(&sorted),
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("a".to_owned(), "2".to_owned()),
+                ("b".to_owned(), "2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sorting_leaves_an_already_ordered_platform_alone() {
+        // The configured platform arrives ordered, so this is the common case. Ordering it here
+        // rather than at its source keeps every version past this change agreeing on the encoded
+        // bytes; a reorder would split action digests between versions that otherwise agree.
+        let ordered = [("OSFamily", "linux"), ("container-image", "docker://img")];
+
+        assert_eq!(
+            names_and_values(&sorted_platform(platform_of(&ordered))),
+            names_and_values(&platform_of(&ordered))
+        );
+    }
+
+    #[test]
+    fn sorting_moves_an_appended_worker_key_into_place() {
+        // Only `prepare_action`'s append of persistentWorkerKey puts the configured platform out
+        // of order in practice.
+        let sorted = sorted_platform(platform_of(&[
+            ("OSFamily", "linux"),
+            ("persistentWorkerKey", "abc"),
+            ("container-image", "docker://img"),
+        ]));
+
+        assert_eq!(
+            names_and_values(&sorted),
+            vec![
+                ("OSFamily".to_owned(), "linux".to_owned()),
+                ("container-image".to_owned(), "docker://img".to_owned()),
+                ("persistentWorkerKey".to_owned(), "abc".to_owned()),
+            ]
+        );
+    }
 }
